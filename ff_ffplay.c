@@ -1,5 +1,4 @@
 /*
- * Copyright (c) 2003 Bilibili
  * Copyright (c) 2003 Fabrice Bellard
  * Copyright (c) 2013 Zhang Rui <bbcallen@gmail.com>
  *
@@ -33,9 +32,8 @@
 #include <limits.h>
 #include <signal.h>
 #include <stdint.h>
-#include <fcntl.h>
-#include <sys/types.h>
-#include <unistd.h>
+
+#include <sys/time.h>
 
 #include "libavutil/avstring.h"
 #include "libavutil/eval.h"
@@ -65,6 +63,7 @@
 
 #include "ijksdl/ijksdl_log.h"
 #include "ijkavformat/ijkavformat.h"
+#include "ijkavformat/ijkioapplication.h"
 #include "ff_cmdutils.h"
 #include "ff_fferror.h"
 #include "ff_ffpipeline.h"
@@ -73,9 +72,6 @@
 #include "ijkmeta.h"
 #include "ijkversion.h"
 #include <stdatomic.h>
-#if defined(__ANDROID__)
-#include "ijksoundtouch/ijksoundtouch_wrap.h"
-#endif
 
 #ifndef AV_CODEC_FLAG2_FAST
 #define AV_CODEC_FLAG2_FAST CODEC_FLAG2_FAST
@@ -114,7 +110,6 @@ static AVPacket flush_pkt;
 #define IJKVERSION_GET_MAJOR(x)     ((x >> 16) & 0xFF)
 #define IJKVERSION_GET_MINOR(x)     ((x >>  8) & 0xFF)
 #define IJKVERSION_GET_MICRO(x)     ((x      ) & 0xFF)
-#define DEBUG_SYNC 1
 
 #if CONFIG_AVFILTER
 static inline
@@ -187,6 +182,8 @@ static int packet_queue_put_private(PacketQueue *q, AVPacket *pkt)
     SDL_CondSignal(q->cond);
     return 0;
 }
+
+
 
 static int packet_queue_put(PacketQueue *q, AVPacket *pkt)
 {
@@ -375,196 +372,10 @@ static void decoder_init(Decoder *d, AVCodecContext *avctx, PacketQueue *queue, 
     SDL_ProfilerReset(&d->decode_profiler, -1);
 }
 
-static int convert_image(FFPlayer *ffp, AVFrame *src_frame, int64_t src_frame_pts, int width, int height) {
-    GetImgInfo *img_info = ffp->get_img_info;
-    VideoState *is = ffp->is;
-    AVFrame *dst_frame = NULL;
-    AVPacket avpkt;
-    int got_packet = 0;
-    int dst_width = 0;
-    int dst_height = 0;
-    int bytes = 0;
-    void *buffer = NULL;
-    char file_path[1024] = {0};
-    char file_name[16] = {0};
-    int fd = -1;
-    int ret = 0;
-    int tmp = 0;
-    float origin_dar = 0;
-    float dar = 0;
-    AVRational display_aspect_ratio;
-    int file_name_length = 0;
-
-    if (!height || !width || !img_info->width || !img_info->height) {
-        ret = -1;
-        return ret;
-    }
-
-    dar = (float) img_info->width / img_info->height;
-
-    if (is->viddec.avctx) {
-        av_reduce(&display_aspect_ratio.num, &display_aspect_ratio.den,
-            is->viddec.avctx->width * (int64_t)is->viddec.avctx->sample_aspect_ratio.num,
-            is->viddec.avctx->height * (int64_t)is->viddec.avctx->sample_aspect_ratio.den,
-            1024 * 1024);
-
-        if (!display_aspect_ratio.num || !display_aspect_ratio.den) {
-            origin_dar = (float) width / height;
-        } else {
-            origin_dar = (float) display_aspect_ratio.num / display_aspect_ratio.den;
-        }
-    } else {
-        ret = -1;
-        return ret;
-    }
-
-    if ((int)(origin_dar * 100) != (int)(dar * 100)) {
-        tmp = img_info->width / origin_dar;
-        if (tmp > img_info->height) {
-            img_info->width = img_info->height * origin_dar;
-        } else {
-            img_info->height = tmp;
-        }
-        av_log(NULL, AV_LOG_INFO, "%s img_info->width = %d, img_info->height = %d\n", __func__, img_info->width, img_info->height);
-    }
-
-    dst_width = img_info->width;
-    dst_height = img_info->height;
-
-    av_init_packet(&avpkt);
-    avpkt.size = 0;
-    avpkt.data = NULL;
-
-    if (!img_info->frame_img_convert_ctx) {
-        img_info->frame_img_convert_ctx = sws_getContext(width,
-		    height,
-		    src_frame->format,
-		    dst_width,
-		    dst_height,
-		    AV_PIX_FMT_RGB24,
-		    SWS_BICUBIC,
-		    NULL,
-		    NULL,
-		    NULL);
-
-        if (!img_info->frame_img_convert_ctx) {
-            ret = -1;
-            av_log(NULL, AV_LOG_ERROR, "%s sws_getContext failed\n", __func__);
-            goto fail0;
-        }
-    }
-
-    if (!img_info->frame_img_codec_ctx) {
-        AVCodec *image_codec = avcodec_find_encoder(AV_CODEC_ID_PNG);
-        if (!image_codec) {
-            ret = -1;
-            av_log(NULL, AV_LOG_ERROR, "%s avcodec_find_encoder failed\n", __func__);
-            goto fail0;
-        }
-	    img_info->frame_img_codec_ctx = avcodec_alloc_context3(image_codec);
-        if (!img_info->frame_img_codec_ctx) {
-            ret = -1;
-            av_log(NULL, AV_LOG_ERROR, "%s avcodec_alloc_context3 failed\n", __func__);
-            goto fail0;
-        }
-        img_info->frame_img_codec_ctx->bit_rate = ffp->stat.bit_rate;
-        img_info->frame_img_codec_ctx->width = dst_width;
-        img_info->frame_img_codec_ctx->height = dst_height;
-        img_info->frame_img_codec_ctx->pix_fmt = AV_PIX_FMT_RGB24;
-        img_info->frame_img_codec_ctx->codec_type = AVMEDIA_TYPE_VIDEO;
-        img_info->frame_img_codec_ctx->time_base.num = ffp->is->video_st->time_base.num;
-        img_info->frame_img_codec_ctx->time_base.den = ffp->is->video_st->time_base.den;
-        avcodec_open2(img_info->frame_img_codec_ctx, image_codec, NULL);
-    }
-
-    dst_frame = av_frame_alloc();
-    if (!dst_frame) {
-        ret = -1;
-        av_log(NULL, AV_LOG_ERROR, "%s av_frame_alloc failed\n", __func__);
-        goto fail0;
-    }
-    bytes = av_image_get_buffer_size(AV_PIX_FMT_RGB24, dst_width, dst_height, 1);
-	buffer = (uint8_t *) av_malloc(bytes * sizeof(uint8_t));
-    if (!buffer) {
-        ret = -1;
-        av_log(NULL, AV_LOG_ERROR, "%s av_image_get_buffer_size failed\n", __func__);
-        goto fail1;
-    }
-
-    dst_frame->format = AV_PIX_FMT_RGB24;
-    dst_frame->width = dst_width;
-    dst_frame->height = dst_height;
-
-    ret = av_image_fill_arrays(dst_frame->data,
-            dst_frame->linesize,
-            buffer,
-            AV_PIX_FMT_RGB24,
-            dst_width,
-            dst_height,
-            1);
-
-    if (ret < 0) {
-        ret = -1;
-        av_log(NULL, AV_LOG_ERROR, "%s av_image_fill_arrays failed\n", __func__);
-        goto fail2;
-    }
-
-    ret = sws_scale(img_info->frame_img_convert_ctx,
-            (const uint8_t * const *) src_frame->data,
-            src_frame->linesize,
-            0,
-            src_frame->height,
-            dst_frame->data,
-            dst_frame->linesize);
-
-    if (ret <= 0) {
-        ret = -1;
-        av_log(NULL, AV_LOG_ERROR, "%s sws_scale failed\n", __func__);
-        goto fail2;
-    }
-
-    ret = avcodec_encode_video2(img_info->frame_img_codec_ctx, &avpkt, dst_frame, &got_packet);
-
-    if (ret >= 0 && got_packet > 0) {
-        strcpy(file_path, img_info->img_path);
-        strcat(file_path, "/");
-        sprintf(file_name, "%lld", src_frame_pts);
-        strcat(file_name, ".png");
-        strcat(file_path, file_name);
-
-        fd = open(file_path, O_RDWR | O_TRUNC | O_CREAT, 0600);
-        if (fd < 0) {
-            ret = -1;
-            av_log(NULL, AV_LOG_ERROR, "%s open path = %s failed %s\n", __func__, file_path, strerror(errno));
-            goto fail2;
-        }
-        write(fd, avpkt.data, avpkt.size);
-        close(fd);
-
-        img_info->count--;
-
-        file_name_length = (int)strlen(file_name) + 1;
-
-        if (img_info->count <= 0)
-            ffp_notify_msg4(ffp, FFP_MSG_GET_IMG_STATE, (int) src_frame_pts, 1, file_name, file_name_length);
-        else
-            ffp_notify_msg4(ffp, FFP_MSG_GET_IMG_STATE, (int) src_frame_pts, 0, file_name, file_name_length);
-
-        ret = 0;
-    }
-
-fail2:
-    av_free(buffer);
-fail1:
-    av_frame_free(&dst_frame);
-fail0:
-    av_packet_unref(&avpkt);
-
-    return ret;
-}
-
 static int decoder_decode_frame(FFPlayer *ffp, Decoder *d, AVFrame *frame, AVSubtitle *sub) {
     int got_frame = 0;
+
+    struct timeval start, end; // declare timestamp here to calculate decoding time
 
     do {
         int ret = -1;
@@ -593,8 +404,22 @@ static int decoder_decode_frame(FFPlayer *ffp, Decoder *d, AVFrame *frame, AVSub
 
         switch (d->avctx->codec_type) {
             case AVMEDIA_TYPE_VIDEO: {
+                gettimeofday(&start, NULL); //start time for decoding a frame
                 ret = avcodec_decode_video2(d->avctx, frame, &got_frame, &d->pkt_temp);
+                gettimeofday(&end, NULL);
+                //calculate the decoding time
+                int timeuse = 1000000 * ( end.tv_sec - start.tv_sec ) + end.tv_usec - start.tv_usec;
+                //ALOGD("Video: time for decoding frame: %d us\n", timeuse);
+                //ALOGD("Video: avcodec_decode_video2() returns : %d \n", ret);
+                //ALOGD("Video: got_frame value is : %d \n", got_frame);
+                /*
+                if (ret > 0)
+                    ALOGD("Video: Decode a frame successfully!!!\n");
+                else
+                    ALOGD("Video: Cannot decode a frame!!!\n");
+                */
                 if (got_frame) {
+                    //ALOGD("Video: Got a frame from avcodec_decode_video2()!!!\n");
                     ffp->stat.vdps = SDL_SpeedSamplerAdd(&ffp->vdps_sampler, FFP_SHOW_VDPS_AVCODEC, "vdps[avcodec]");
                     if (ffp->decoder_reorder_pts == -1) {
                         frame->pts = av_frame_get_best_effort_timestamp(frame);
@@ -897,7 +722,8 @@ static void video_image_display2(FFPlayer *ffp)
                 }
             }
         }
-        SDL_VoutDisplayYUVOverlay(ffp->vout, vp->bmp);
+        SDL_VoutDisplayYUVOverlay(ffp->vout, vp->bmp); //display the picture on screen
+        //ALOGD("Video: This is where actual displaying happens\n");
         ffp->stat.vfps = SDL_SpeedSamplerAdd(&ffp->vfps_sampler, FFP_SHOW_VFPS_FFPLAY, "vfps[ffplay]");
         if (!ffp->first_video_frame_rendered) {
             ffp->first_video_frame_rendered = 1;
@@ -1001,10 +827,7 @@ static void stream_close(FFPlayer *ffp)
     frame_queue_destory(&is->pictq);
     frame_queue_destory(&is->sampq);
     frame_queue_destory(&is->subpq);
-    SDL_DestroyCond(is->audio_accurate_seek_cond);
-    SDL_DestroyCond(is->video_accurate_seek_cond);
     SDL_DestroyCond(is->continue_read_thread);
-    SDL_DestroyMutex(is->accurate_seek_mutex);
     SDL_DestroyMutex(is->play_mutex);
 #if !CONFIG_AVFILTER
     sws_freeContext(is->img_convert_ctx);
@@ -1012,22 +835,6 @@ static void stream_close(FFPlayer *ffp)
 #ifdef FFP_MERGE
     sws_freeContext(is->sub_convert_ctx);
 #endif
-
-#if defined(__ANDROID__)
-    if (ffp->soundtouch_enable && is->handle != NULL) {
-        ijk_soundtouch_destroy(is->handle);
-    }
-#endif
-    if (ffp->get_img_info) {
-        if (ffp->get_img_info->frame_img_convert_ctx) {
-            sws_freeContext(ffp->get_img_info->frame_img_convert_ctx);
-        }
-        if (ffp->get_img_info->frame_img_codec_ctx) {
-            avcodec_free_context(&ffp->get_img_info->frame_img_codec_ctx);
-        }
-        av_freep(&ffp->get_img_info->img_path);
-        av_freep(&ffp->get_img_info);
-    }
     av_free(is->filename);
     av_free(is);
     ffp->is = NULL;
@@ -1042,6 +849,7 @@ static void stream_close(FFPlayer *ffp)
 static void video_display2(FFPlayer *ffp)
 {
     VideoState *is = ffp->is;
+    //ALOGD("Video: Display a frame!!!\n");
     if (is->video_st)
         video_image_display2(ffp);
 }
@@ -1280,6 +1088,8 @@ static void video_refresh(FFPlayer *opaque, double *remaining_time)
 
     Frame *sp, *sp2;
 
+    //ALOGD("Video: video_refresh() is called\n");
+
     if (!is->paused && get_master_sync_type(is) == AV_SYNC_EXTERNAL_CLOCK && is->realtime)
         check_external_clock_speed(is);
 
@@ -1292,7 +1102,8 @@ static void video_refresh(FFPlayer *opaque, double *remaining_time)
         *remaining_time = FFMIN(*remaining_time, is->last_vis_time + ffp->rdftspeed - time);
     }
 
-    if (is->video_st) {
+    if (is->video_st) {   
+        //ALOGD("Video: Video stream exists\n");
 retry:
         if (frame_queue_nb_remaining(&is->pictq) == 0) {
             // nothing to do, no picture to display in the queue
@@ -1381,8 +1192,15 @@ retry:
         }
 display:
         /* display picture */
-        if (!ffp->display_disable && is->force_refresh && is->show_mode == SHOW_MODE_VIDEO && is->pictq.rindex_shown)
+        //if (!ffp->display_disable && is->force_refresh && is->show_mode == SHOW_MODE_VIDEO && is->pictq.rindex_shown){
+        if (!ffp->display_disable && is->force_refresh && is->show_mode == SHOW_MODE_VIDEO && is->pictq.rindex_shown){
             video_display2(ffp);
+            //ALOGD("Video: We can display a frame!!!\n");
+        } else {
+            //ALOGD("Video: We cannot display a frame!!!\n");
+        }
+        /* with out the if judgement, we only display a single static frame, no goal! */
+        //video_display2(ffp);
     }
     is->force_refresh = 0;
     if (ffp->show_status) {
@@ -1449,7 +1267,7 @@ static void alloc_picture(FFPlayer *ffp, int frame_format)
 #endif
 
     SDL_VoutSetOverlayFormat(ffp->vout, ffp->overlay_format);
-    vp->bmp = SDL_Vout_CreateOverlay(vp->width, vp->height,
+    vp->bmp = SDL_Vout_CreateOverlay(vp->width, (vp->height),
                                    frame_format,
                                    ffp->vout);
 #ifdef FFP_MERGE
@@ -1482,83 +1300,11 @@ static int queue_picture(FFPlayer *ffp, AVFrame *src_frame, double pts, double d
 {
     VideoState *is = ffp->is;
     Frame *vp;
-    int video_accurate_seek_fail = 0;
-    int64_t video_seek_pos = 0;
-    int64_t now = 0;
-    int64_t deviation = 0;
 
-    if (ffp->enable_accurate_seek && is->video_accurate_seek_req && !is->seek_req) {
-        if (!isnan(pts)) {
-            video_seek_pos = is->seek_pos;
-            is->accurate_seek_vframe_pts = pts * 1000 * 1000;
-            deviation = llabs((int64_t)(pts * 1000 * 1000) - is->seek_pos);
-            if ((pts * 1000 * 1000 < is->seek_pos) || deviation > MAX_DEVIATION) {
-                now = av_gettime_relative() / 1000;
-                if (is->drop_vframe_count == 0) {
-                    SDL_LockMutex(is->accurate_seek_mutex);
-                    if (is->accurate_seek_start_time <= 0 && (is->audio_stream < 0 || is->audio_accurate_seek_req)) {
-                        is->accurate_seek_start_time = now;
-                    }
-                    SDL_UnlockMutex(is->accurate_seek_mutex);
-                    av_log(NULL, AV_LOG_INFO, "video accurate_seek start, is->seek_pos=%lld, pts=%lf, is->accurate_seek_time = %lld\n", is->seek_pos, pts, is->accurate_seek_start_time);
-                }
-                is->drop_vframe_count++;
-                if ((now - is->accurate_seek_start_time) <= ffp->accurate_seek_timeout) {
-                    return 1;  // drop some old frame when do accurate seek
-                } else {
-                    av_log(NULL, AV_LOG_WARNING, "video accurate_seek is error, is->drop_vframe_count=%d, now = %lld, pts = %lf\n", is->drop_vframe_count, now, pts);
-                    video_accurate_seek_fail = 1;  // if KEY_FRAME interval too big, disable accurate seek
-                }
-            } else {
-                av_log(NULL, AV_LOG_INFO, "video accurate_seek is ok, is->drop_vframe_count =%d, is->seek_pos=%lld, pts=%lf\n", is->drop_vframe_count, is->seek_pos, pts);
-                if (video_seek_pos == is->seek_pos) {
-                    is->drop_vframe_count       = 0;
-                    SDL_LockMutex(is->accurate_seek_mutex);
-                    is->video_accurate_seek_req = 0;
-                    SDL_CondSignal(is->audio_accurate_seek_cond);
-                    if (video_seek_pos == is->seek_pos && is->audio_accurate_seek_req && !is->abort_request) {
-                        SDL_CondWaitTimeout(is->video_accurate_seek_cond, is->accurate_seek_mutex, ffp->accurate_seek_timeout);
-                    } else {
-                        ffp_notify_msg2(ffp, FFP_MSG_ACCURATE_SEEK_COMPLETE, (int)(pts * 1000));
-                    }
-                    if (video_seek_pos != is->seek_pos && !is->abort_request) {
-                        is->video_accurate_seek_req = 1;
-                        SDL_UnlockMutex(is->accurate_seek_mutex);
-                        return 1;
-                    }
-
-                    SDL_UnlockMutex(is->accurate_seek_mutex);
-                }
-            }
-        } else {
-            video_accurate_seek_fail = 1;
-        }
-
-        if (video_accurate_seek_fail) {
-            is->drop_vframe_count = 0;
-            SDL_LockMutex(is->accurate_seek_mutex);
-            is->video_accurate_seek_req = 0;
-            SDL_CondSignal(is->audio_accurate_seek_cond);
-            if (is->audio_accurate_seek_req && !is->abort_request) {
-                SDL_CondWaitTimeout(is->video_accurate_seek_cond, is->accurate_seek_mutex, ffp->accurate_seek_timeout);
-            } else {
-                if (!isnan(pts)) {
-                    ffp_notify_msg2(ffp, FFP_MSG_ACCURATE_SEEK_COMPLETE, (int)(pts * 1000));
-                } else {
-                    ffp_notify_msg2(ffp, FFP_MSG_ACCURATE_SEEK_COMPLETE, 0);
-                }
-            }
-            SDL_UnlockMutex(is->accurate_seek_mutex);
-        }
-        is->accurate_seek_start_time = 0;
-        video_accurate_seek_fail = 0;
-        is->accurate_seek_vframe_pts = 0;
-    }
-
-#if defined(DEBUG_SYNC)
-    printf("frame_type=%c pts=%0.3f\n",
-           av_get_picture_type_char(src_frame->pict_type), pts); //give the picture type whether I/P/B frame
-#endif
+//#if defined(DEBUG_SYNC)
+    printf("from ff_play.c, frame_type=%c pts=%0.3f\n",
+           av_get_picture_type_char(src_frame->pict_type), pts);
+//#endif
 
     if (!(vp = frame_queue_peek_writable(&is->pictq)))
         return -1;
@@ -1574,8 +1320,9 @@ static int queue_picture(FFPlayer *ffp, AVFrame *src_frame, double pts, double d
         vp->height != src_frame->height ||
         vp->format != src_frame->format) {
 
-        if (vp->width != src_frame->width || vp->height != src_frame->height)
-            ffp_notify_msg3(ffp, FFP_MSG_VIDEO_SIZE_CHANGED, src_frame->width, src_frame->height); //notify the final resolution
+        //if (vp->width != src_frame->width || vp->height != src_frame->height)
+        ffp_notify_msg3(ffp, FFP_MSG_VIDEO_SIZE_CHANGED, src_frame->width, src_frame->height);
+	printf("\n the changed video file size = %d",FFP_MSG_VIDEO_SIZE_CHANGED);
 
         vp->allocated = 0;
         vp->width = src_frame->width;
@@ -1626,7 +1373,6 @@ static int queue_picture(FFPlayer *ffp, AVFrame *src_frame, double pts, double d
         frame_queue_push(&is->pictq);
         if (!is->viddec.first_frame_decoded) {
             ALOGD("Video: first frame decoded\n");
-            ffp_notify_msg1(ffp, FFP_MSG_VIDEO_DECODED_START);
             is->viddec.first_frame_decoded_time = SDL_GetTickHR();
             is->viddec.first_frame_decoded = 1;
         }
@@ -1644,6 +1390,7 @@ static int get_video_frame(FFPlayer *ffp, AVFrame *frame)
         return -1;
 
     if (got_picture) {
+        //ALOGD("Video: Got a picture here\n");
         double dpts = NAN;
 
         if (frame->pts != AV_NOPTS_VALUE)
@@ -1652,7 +1399,6 @@ static int get_video_frame(FFPlayer *ffp, AVFrame *frame)
         frame->sample_aspect_ratio = av_guess_sample_aspect_ratio(is->ic, is->video_st, frame);
 
         if (ffp->framedrop>0 || (ffp->framedrop && get_master_sync_type(is) != AV_SYNC_VIDEO_MASTER)) {
-            ffp->stat.decode_frame_count++;
             if (frame->pts != AV_NOPTS_VALUE) {
                 double diff = dpts - get_master_clock(is);
                 if (!isnan(diff) && fabs(diff) < AV_NOSYNC_THRESHOLD &&
@@ -1664,8 +1410,6 @@ static int get_video_frame(FFPlayer *ffp, AVFrame *frame)
                     if (is->continuous_frame_drops_early > ffp->framedrop) {
                         is->continuous_frame_drops_early = 0;
                     } else {
-                        ffp->stat.drop_frame_count++;
-                        ffp->stat.drop_frame_rate = (float)(ffp->stat.drop_frame_count) / (float)(ffp->stat.decode_frame_count);
                         av_frame_unref(frame);
                         got_picture = 0;
                     }
@@ -1932,15 +1676,6 @@ static int audio_thread(void *arg)
     int got_frame = 0;
     AVRational tb;
     int ret = 0;
-    int audio_accurate_seek_fail = 0;
-    int64_t audio_seek_pos = 0;
-    double frame_pts = 0;
-    double audio_clock = 0;
-    int64_t now = 0;
-    double samples_duration = 0;
-    int64_t deviation = 0;
-    int64_t deviation2 = 0;
-    int64_t deviation3 = 0;
 
     if (!frame)
         return AVERROR(ENOMEM);
@@ -1952,91 +1687,6 @@ static int audio_thread(void *arg)
 
         if (got_frame) {
                 tb = (AVRational){1, frame->sample_rate};
-                if (ffp->enable_accurate_seek && is->audio_accurate_seek_req && !is->seek_req) {
-                    frame_pts = (frame->pts == AV_NOPTS_VALUE) ? NAN : frame->pts * av_q2d(tb);
-                    now = av_gettime_relative() / 1000;
-                    if (!isnan(frame_pts)) {
-                        samples_duration = (double) frame->nb_samples / frame->sample_rate;
-                        audio_clock = frame_pts + samples_duration;
-                        audio_seek_pos = is->seek_pos;
-                        deviation = llabs((int64_t)(audio_clock * 1000 * 1000) - is->seek_pos);
-                        if ((audio_clock * 1000 * 1000 < is->seek_pos ) || deviation > MAX_DEVIATION) {
-                            if (is->drop_aframe_count == 0) {
-                                SDL_LockMutex(is->accurate_seek_mutex);
-                                if (is->accurate_seek_start_time <= 0 && (is->video_stream < 0 || is->video_accurate_seek_req)) {
-                                    is->accurate_seek_start_time = now;
-                                }
-                                SDL_UnlockMutex(is->accurate_seek_mutex);
-                                av_log(NULL, AV_LOG_INFO, "audio accurate_seek start, is->seek_pos=%lld, audio_clock=%lf, is->accurate_seek_start_time = %lld\n", is->seek_pos, audio_clock, is->accurate_seek_start_time);
-                            }
-                            is->drop_aframe_count++;
-                            while (is->video_accurate_seek_req && !is->abort_request) {
-                                deviation2 = is->accurate_seek_vframe_pts - audio_clock * 1000 * 1000;
-                                deviation3 = is->accurate_seek_vframe_pts - is->seek_pos;
-                                if (deviation2 > 0 && deviation3 < 0) {
-                                    break;
-                                } else {
-                                    av_usleep(20 * 1000);
-                                }
-                                now = av_gettime_relative() / 1000;
-                                if ((now - is->accurate_seek_start_time) > ffp->accurate_seek_timeout) {
-                                    break;
-                                }
-                            }
-
-                            if(!is->video_accurate_seek_req && is->video_stream >= 0 && audio_clock * 1000 * 1000 > is->accurate_seek_vframe_pts) {
-                                audio_accurate_seek_fail = 1;
-                            } else {
-                                now = av_gettime_relative() / 1000;
-                                if ((now - is->accurate_seek_start_time) <= ffp->accurate_seek_timeout) {
-                                    av_frame_unref(frame);
-                                    continue;  // drop some old frame when do accurate seek
-                                } else {
-                                    audio_accurate_seek_fail = 1;
-                                }
-                            }
-                        } else {
-                            if (audio_seek_pos == is->seek_pos) {
-                                av_log(NULL, AV_LOG_INFO, "audio accurate_seek is ok, is->drop_aframe_count=%d, audio_clock = %lf\n", is->drop_aframe_count, audio_clock);
-                                is->drop_aframe_count       = 0;
-                                SDL_LockMutex(is->accurate_seek_mutex);
-                                is->audio_accurate_seek_req = 0;
-                                SDL_CondSignal(is->video_accurate_seek_cond);
-                                if (audio_seek_pos == is->seek_pos && is->video_accurate_seek_req && !is->abort_request) {
-                                    SDL_CondWaitTimeout(is->audio_accurate_seek_cond, is->accurate_seek_mutex, ffp->accurate_seek_timeout);
-                                } else {
-                                    ffp_notify_msg2(ffp, FFP_MSG_ACCURATE_SEEK_COMPLETE, (int)(audio_clock * 1000));
-                                }
-
-                                if (audio_seek_pos != is->seek_pos && !is->abort_request) {
-                                    is->audio_accurate_seek_req = 1;
-                                    SDL_UnlockMutex(is->accurate_seek_mutex);
-                                    av_frame_unref(frame);
-                                    continue;
-                                }
-
-                                SDL_UnlockMutex(is->accurate_seek_mutex);
-                            }
-                        }
-                    } else {
-                        audio_accurate_seek_fail = 1;
-                    }
-                    if (audio_accurate_seek_fail) {
-                        av_log(NULL, AV_LOG_INFO, "audio accurate_seek is error, is->drop_aframe_count=%d, now = %lld, audio_clock = %lf\n", is->drop_aframe_count, now, audio_clock);
-                        is->drop_aframe_count       = 0;
-                        SDL_LockMutex(is->accurate_seek_mutex);
-                        is->audio_accurate_seek_req = 0;
-                        SDL_CondSignal(is->video_accurate_seek_cond);
-                        if (is->video_accurate_seek_req && !is->abort_request) {
-                            SDL_CondWaitTimeout(is->audio_accurate_seek_cond, is->accurate_seek_mutex, ffp->accurate_seek_timeout);
-                        } else {
-                            ffp_notify_msg2(ffp, FFP_MSG_ACCURATE_SEEK_COMPLETE, (int)(audio_clock * 1000));
-                        }
-                        SDL_UnlockMutex(is->accurate_seek_mutex);
-                    }
-                    is->accurate_seek_start_time = 0;
-                    audio_accurate_seek_fail = 0;
-                }
 
 #if CONFIG_AVFILTER
                 dec_channel_layout = get_valid_channel_layout(frame->channel_layout, av_frame_get_channels(frame));
@@ -2077,7 +1727,7 @@ static int audio_thread(void *arg)
                 goto the_end;
 
             while ((ret = av_buffersink_get_frame_flags(is->out_audio_filter, frame, 0)) >= 0) {
-                tb = av_buffersink_get_time_base(is->out_audio_filter);
+                tb = is->out_audio_filter->inputs[0]->time_base;
 #endif
                 if (!(af = frame_queue_peek_writable(&is->sampq)))
                     goto the_end;
@@ -2128,10 +1778,6 @@ static int ffplay_video_thread(void *arg)
     int ret;
     AVRational tb = is->video_st->time_base;
     AVRational frame_rate = av_guess_frame_rate(is->ic, is->video_st, NULL);
-    int64_t dst_pts = -1;
-    int64_t last_dst_pts = -1;
-    int retry_convert_image = 0;
-    int convert_frame_count = 0;
 
 #if CONFIG_AVFILTER
     AVFilterGraph *graph = avfilter_graph_alloc();
@@ -2164,50 +1810,6 @@ static int ffplay_video_thread(void *arg)
         if (!ret)
             continue;
 
-        if (ffp->get_frame_mode) {
-            if (!ffp->get_img_info || ffp->get_img_info->count <= 0) {
-                av_frame_unref(frame);
-                continue;
-            }
-
-            last_dst_pts = dst_pts;
-
-            if (dst_pts < 0) {
-                dst_pts = ffp->get_img_info->start_time;
-            } else {
-                dst_pts += (ffp->get_img_info->end_time - ffp->get_img_info->start_time) / (ffp->get_img_info->num - 1);
-            }
-
-            pts = (frame->pts == AV_NOPTS_VALUE) ? NAN : frame->pts * av_q2d(tb);
-            pts = pts * 1000;
-            if (pts >= dst_pts) {
-                while (retry_convert_image <= MAX_RETRY_CONVERT_IMAGE) {
-                    ret = convert_image(ffp, frame, (int64_t)pts, frame->width, frame->height);
-                    if (!ret) {
-                        convert_frame_count++;
-                        break;
-                    }
-                    retry_convert_image++;
-                    av_log(NULL, AV_LOG_ERROR, "convert image error retry_convert_image = %d\n", retry_convert_image);
-                }
-
-                retry_convert_image = 0;
-                if (ret || ffp->get_img_info->count <= 0) {
-                    if (ret) {
-                        av_log(NULL, AV_LOG_ERROR, "convert image abort ret = %d\n", ret);
-                        ffp_notify_msg3(ffp, FFP_MSG_GET_IMG_STATE, 0, ret);
-                    } else {
-                        av_log(NULL, AV_LOG_INFO, "convert image complete convert_frame_count = %d\n", convert_frame_count);
-                    }
-                    goto the_end;
-                }
-            } else {
-                dst_pts = last_dst_pts;
-            }
-            av_frame_unref(frame);
-            continue;
-        }
-
 #if CONFIG_AVFILTER
         if (   last_w != frame->width
             || last_h != frame->height
@@ -2237,7 +1839,7 @@ static int ffplay_video_thread(void *arg)
             last_format = frame->format;
             last_serial = is->viddec.pkt_serial;
             last_vfilter_idx = is->vfilter_idx;
-            frame_rate = av_buffersink_get_frame_rate(filt_out);
+            frame_rate = filt_out->inputs[0]->frame_rate;
             SDL_UnlockMutex(ffp->vf_mutex);
         }
 
@@ -2259,12 +1861,12 @@ static int ffplay_video_thread(void *arg)
             is->frame_last_filter_delay = av_gettime_relative() / 1000000.0 - is->frame_last_returned_time;
             if (fabs(is->frame_last_filter_delay) > AV_NOSYNC_THRESHOLD / 10.0)
                 is->frame_last_filter_delay = 0;
-            tb = av_buffersink_get_time_base(filt_out);
+            tb = filt_out->inputs[0]->time_base;
 #endif
             duration = (frame_rate.num && frame_rate.den ? av_q2d((AVRational){frame_rate.den, frame_rate.num}) : 0);
             pts = (frame->pts == AV_NOPTS_VALUE) ? NAN : frame->pts * av_q2d(tb);
             ret = queue_picture(ffp, frame, pts, duration, av_frame_get_pkt_pos(frame), is->viddec.pkt_serial);
-            av_frame_unref(frame);
+            //av_frame_unref(frame);
 #if CONFIG_AVFILTER
         }
 #endif
@@ -2276,12 +1878,11 @@ static int ffplay_video_thread(void *arg)
 #if CONFIG_AVFILTER
     avfilter_graph_free(&graph);
 #endif
-    av_log(NULL, AV_LOG_INFO, "convert image convert_frame_count = %d\n", convert_frame_count);
     av_frame_free(&frame);
     return 0;
 }
 
-static int video_thread(void *arg)
+static int original_video_thread(void *arg)
 {
     FFPlayer *ffp = (FFPlayer *)arg;
     int       ret = 0;
@@ -2290,6 +1891,11 @@ static int video_thread(void *arg)
         ret = ffpipenode_run_sync(ffp->node_vdec);
     }
     return ret;
+}
+
+static int video_thread(void *arg)
+{
+    FFPlayer *ffp = (FFPlayer *)arg;
 }
 
 static int subtitle_thread(void *arg)
@@ -2409,9 +2015,6 @@ static int audio_decode_frame(FFPlayer *ffp)
     av_unused double audio_clock0;
     int wanted_nb_samples;
     Frame *af;
-#if defined(__ANDROID__)
-    int translate_time = 1;
-#endif
 
     if (is->paused || is->step)
         return -1;
@@ -2430,7 +2033,7 @@ static int audio_decode_frame(FFPlayer *ffp)
             return -1;
         }
     }
-reload:
+
     do {
 #if defined(_WIN32) || defined(__APPLE__)
         while (frame_queue_nb_remaining(&is->sampq) == 0) {
@@ -2508,7 +2111,6 @@ reload:
             }
         }
         av_fast_malloc(&is->audio_buf1, &is->audio_buf1_size, out_size);
-
         if (!is->audio_buf1)
             return AVERROR(ENOMEM);
         len2 = swr_convert(is->swr_ctx, out, out_count, in, af->frame->nb_samples);
@@ -2522,27 +2124,7 @@ reload:
                 swr_free(&is->swr_ctx);
         }
         is->audio_buf = is->audio_buf1;
-        int bytes_per_sample = av_get_bytes_per_sample(is->audio_tgt.fmt);
-        resampled_data_size = len2 * is->audio_tgt.channels * bytes_per_sample;
-#if defined(__ANDROID__)
-        if (ffp->soundtouch_enable && ffp->pf_playback_rate != 1.0f && !is->abort_request) {
-            av_fast_malloc(&is->audio_new_buf, &is->audio_new_buf_size, out_size * translate_time);
-            for (int i = 0; i < (resampled_data_size / 2); i++)
-            {
-                is->audio_new_buf[i] = (is->audio_buf1[i * 2] | (is->audio_buf1[i * 2 + 1] << 8));
-            }
-
-            int ret_len = ijk_soundtouch_translate(is->handle, is->audio_new_buf, (float)(ffp->pf_playback_rate), (float)(1.0f/ffp->pf_playback_rate),
-                    resampled_data_size / 2, bytes_per_sample, is->audio_tgt.channels, af->frame->sample_rate);
-            if (ret_len > 0) {
-                is->audio_buf = (uint8_t*)is->audio_new_buf;
-                resampled_data_size = ret_len;
-            } else {
-                translate_time++;
-                goto reload;
-            }
-        }
-#endif
+        resampled_data_size = len2 * is->audio_tgt.channels * av_get_bytes_per_sample(is->audio_tgt.fmt);
     } else {
         is->audio_buf = af->frame->data[0];
         resampled_data_size = data_size;
@@ -2566,7 +2148,6 @@ reload:
 #endif
     if (!is->auddec.first_frame_decoded) {
         ALOGD("avcodec/Audio: first frame decoded\n");
-        ffp_notify_msg1(ffp, FFP_MSG_AUDIO_DECODED_START);
         is->auddec.first_frame_decoded_time = SDL_GetTickHR();
         is->auddec.first_frame_decoded = 1;
     }
@@ -2592,13 +2173,7 @@ static void sdl_audio_callback(void *opaque, Uint8 *stream, int len)
 
     if (ffp->pf_playback_rate_changed) {
         ffp->pf_playback_rate_changed = 0;
-#if defined(__ANDROID__)
-        if (!ffp->soundtouch_enable) {
-            SDL_AoutSetPlaybackRate(ffp->aout, ffp->pf_playback_rate);
-        }
-#else
         SDL_AoutSetPlaybackRate(ffp->aout, ffp->pf_playback_rate);
-#endif
     }
     if (ffp->pf_playback_volume_changed) {
         ffp->pf_playback_volume_changed = 0;
@@ -2759,6 +2334,7 @@ static int stream_component_open(FFPlayer *ffp, int stream_index)
     av_codec_set_pkt_timebase(avctx, ic->streams[stream_index]->time_base);
 
     codec = avcodec_find_decoder(avctx->codec_id);
+    ALOGD("Video: The codec_id is %d \n", avctx->codec_id);
 
     switch (avctx->codec_type) {
         case AVMEDIA_TYPE_AUDIO   : is->last_audio_stream    = stream_index; forced_codec_name = ffp->audio_codec_name; break;
@@ -2766,8 +2342,10 @@ static int stream_component_open(FFPlayer *ffp, int stream_index)
         case AVMEDIA_TYPE_VIDEO   : is->last_video_stream    = stream_index; forced_codec_name = ffp->video_codec_name; break;
         default: break;
     }
-    if (forced_codec_name)
+
+    if (forced_codec_name) 
         codec = avcodec_find_decoder_by_name(forced_codec_name);
+
     if (!codec) {
         if (forced_codec_name) av_log(NULL, AV_LOG_WARNING,
                                       "No codec could be found with name '%s'\n", forced_codec_name);
@@ -2819,7 +2397,7 @@ static int stream_component_open(FFPlayer *ffp, int stream_index)
     case AVMEDIA_TYPE_AUDIO:
 #if CONFIG_AVFILTER
         {
-            AVFilterContext *sink;
+            AVFilterLink *link;
 
             is->audio_filter_src.freq           = avctx->sample_rate;
             is->audio_filter_src.channels       = avctx->channels;
@@ -2832,10 +2410,10 @@ static int stream_component_open(FFPlayer *ffp, int stream_index)
             }
             ffp->af_changed = 0;
             SDL_UnlockMutex(ffp->af_mutex);
-            sink = is->out_audio_filter;
-            sample_rate    = av_buffersink_get_sample_rate(sink);
-            nb_channels    = av_buffersink_get_channels(sink);
-            channel_layout = av_buffersink_get_channel_layout(sink);
+            link = is->out_audio_filter->inputs[0];
+            sample_rate    = link->sample_rate;
+            nb_channels    = avfilter_link_get_channels(link);
+            channel_layout = link->channel_layout;
         }
 #else
         sample_rate    = avctx->sample_rate;
@@ -2969,8 +2547,2764 @@ static int is_realtime(AVFormatContext *s)
     return 0;
 }
 
-/* this thread gets the stream from the disk or the network */
+
+
+//int direction=1;
+static int orien=1;
+//Using a global flag to control the direction
+void ff_set_direction(int direction)
+{
+	/**
+	** 0 --> forward
+	** 1 --> backward
+	**/
+
+	//ALOGD("ff_set_direction in ff_ffplay.c, direction = %d", direction);
+	orien = direction;
+	
+}
+
+
+
+
+//to enable pipelining, define SDL overlay and frame as global parameter.
+SDL_VoutOverlay *bmp;  
+AVFrame *pFrame = NULL;
+AVFrame *pFrame_part_1 = NULL;
+AVFrame *pFrame_part_2 = NULL;
+AVFrame *pFrame_part_3 = NULL;
+AVFrame *pFrame_part_4 = NULL;
+AVFrame *pFrame_display = NULL;
+
+
+uint8_t * buff=NULL; // = (uint8_t * ) av_malloc(bytes_num);
+uint8_t * buff_display=NULL; // = (uint8_t * ) av_malloc(bytes_num);
+
+//set mutex and cond
+SDL_mutex *subframe_num_lock = NULL;// = SDL_CreateMutex();
+SDL_mutex *read_thread_lock =NULL;
+SDL_mutex *display_thread_lock = NULL; // = SDL_CreateMutex();
+int subframe_num = 0;
+
+SDL_cond *read_thread_cond = NULL;// = SDL_CreateCond();
+SDL_cond *display_thread_cond = NULL;// = SDL_CreateCond();
+
+SDL_mutex *Frame_lock = NULL;
+SDL_mutex *Frame_cond_push = NULL;
+SDL_mutex *Frame_cond_pull = NULL;
+bool Frame_occupied = false;
+//SDL_bool Frame_occupied;// = SDL_FALSE;
+
+//define the frame number
+const int frame_num = 127;
+
+
+
+// We define another thread to achieve video frame's random access, decode and display together, which is sequnetial
 static int read_thread(void *arg)
+{
+    //ijkplayer
+    printf("\n Inside the read thread");
+    FFPlayer *ffp = arg;
+    VideoState *is = ffp->is;
+    AVFormatContext *ic = NULL;
+    double pts;
+    double duration;
+    //SDL_VoutOverlay *bmp;  
+
+    //ffmpeg
+    int               i, videoStream;
+    AVCodecContext    *pCodecCtxOrig = NULL;
+    AVCodecContext    *pCodecCtx = NULL;
+    AVCodec           *pCodec = NULL;
+    //AVFrame           *pFrame = NULL;
+    AVPacket          packet;
+    int               frameFinished;
+
+    struct timeval decode_start, decode_end, seek_start, seek_end;
+    int frameIndex = 0;
+    //long msec = (1000 * frameIndex) / 64;
+    int ret;
+    long msec;
+    int64_t seekTarget;
+    int seek_timeuse, decode_timeuse;
+
+    ALOGD("Video: The read_thread is executed now!!!\n");
+    // Register all formats and codecs
+    av_register_all();
+
+    ic = avformat_alloc_context();
+    if(!ic){
+        ALOGD("Video: avformat_alloc_context() failed!!!\n");
+        return -1;
+    }
+    ic->interrupt_callback.callback = decode_interrupt_cb;
+    ic->interrupt_callback.opaque = is;
+
+    // Open video file
+    if(avformat_open_input(&ic, is->filename, NULL, NULL)!=0) {
+	//char *path="/sdcard/P1_video/viking_4K_128Frames_Part_1.mp4";
+	//if(avformat_open_input(&ic, path, NULL, NULL)!=0) {
+        ALOGD("Video: Couldn't open file\n");
+        return -1;
+    } 
+
+    // Retrieve stream information
+    if(avformat_find_stream_info(ic, NULL)<0) {
+        ALOGD("Video: Couldn't find stream information\n");
+        return -1;
+    }
+
+    // Dump information about file onto standard error
+    av_dump_format(ic, 0, is->filename, 0);
+
+    videoStream=-1;
+    for(i=0; i<ic->nb_streams; i++) {
+        if(ic->streams[i]->codec->codec_type==AVMEDIA_TYPE_VIDEO) {
+            videoStream=i;
+            break;
+        }
+    }
+    if(videoStream==-1) {
+        ALOGD("Video: Didn't find a video stream\n");
+        return -1;
+    }
+
+    // Get a pointer to the codec context for the video stream
+    pCodecCtxOrig=ic->streams[videoStream]->codec;
+
+    // Find the decoder for the video stream
+    pCodec = avcodec_find_decoder(pCodecCtxOrig->codec_id);
+
+    // Copy context
+    pCodecCtx = avcodec_alloc_context3(pCodec);
+
+    if(avcodec_copy_context(pCodecCtx, pCodecCtxOrig) != 0) {
+        ALOGD(stderr, "Couldn't copy codec context");
+        return -1; // Error copying codec context
+    }
+
+    // Open codec
+    if(avcodec_open2(pCodecCtx, pCodec, NULL)<0) {
+        ALOGD("Video: Could not open codec\n");
+        return -1;
+    }
+
+    // Allocate video frame
+    pFrame = av_frame_alloc();
+    ALOGD("Video: Break point 1\n");
+
+    SDL_VoutSetOverlayFormat(ffp->vout, ffp->overlay_format);
+
+    // Now matter what function we employed, we read and decode the I frame first
+    av_read_frame(ic, &packet);
+
+    ret = avcodec_decode_video2(pCodecCtx, pFrame, &frameFinished, &packet);
+
+    bmp = SDL_Vout_CreateOverlay(pFrame->width, 2048,//(pFrame->height)*4,
+                    pFrame->format,
+                    ffp->vout);
+    /*ALOGD("avcodec_decode_video2() returns : %d \n", ret);
+    if (frameFinished){
+        ALOGD("The frame is finished \n");
+        VRdisplay(ffp, pFrame);
+    }    
+    else
+        ALOGD("Frame is not finished \n");*/
+
+	
+    if (is->video_st && is->video_st->codecpar) {
+        AVCodecParameters *codecpar = is->video_st->codecpar;
+        ffp_notify_msg3(ffp, FFP_MSG_VIDEO_SIZE_CHANGED, codecpar->width, codecpar->height);
+        ffp_notify_msg3(ffp, FFP_MSG_SAR_CHANGED, codecpar->sample_aspect_ratio.num, codecpar->sample_aspect_ratio.den);
+    }
+	
+	ffp->prepared = true;
+    ffp_notify_msg1(ffp, FFP_MSG_PREPARED);
+	ffp_notify_msg3(ffp, FFP_MSG_BUFFERING_UPDATE, 100, 100);
+	
+    i = 0;
+	
+	int bytes_num = avpicture_get_size(pFrame->format , 4096, 2048);
+	uint8_t * buff = (uint8_t * ) av_malloc(bytes_num);
+	
+
+	
+    while(!is->abort_request){      
+        // Now, we achieve the random access using av_seek_frame()
+        //if (is->move_req) {
+        //frameIndex = is->move_pos;
+        //gettimeofday(&start, NULL);
+		
+		
+		/** modification **/
+		
+		
+		/* set direction according to controller */
+		frameIndex = frameIndex + orien;
+		printf("\nfrom ff_play.c, the frameIndex = %d and orientation = %d", frameIndex, orien); 
+		if (frameIndex < 0)
+			frameIndex = frame_num;
+		
+		if (frameIndex > frame_num)
+			frameIndex = 0;
+
+		
+		/** modification **/
+		
+		
+		
+		
+        msec = (1000 * frameIndex) / 64;
+	printf("\nfrom ff_play.c, the frameIndex = %d and orientation = %d and in msec = %d", frameIndex, orien, (int)msec); 
+        //long msec = (1000 * is->move_pos) / 64;
+        seekTarget = milliseconds_to_fftime(msec);
+        gettimeofday(&seek_start, NULL);
+        ret = avformat_seek_file(ic, -1, INT64_MIN, seekTarget, INT64_MAX, AVSEEK_FLAG_ANY);
+        gettimeofday(&seek_end, NULL);
+        seek_timeuse = 1000000 * ( seek_end.tv_sec - seek_start.tv_sec ) + seek_end.tv_usec - seek_start.tv_usec;
+        //ALOGD("Video: The seeking time for frame %d is %d us\n", frameIndex, seek_timeuse);
+        //ALOGD("Viedo: avformat_seek_file() returns %d \n", ret);
+        if(ret < 0)
+            ALOGD("Video: avformat_seek_file() failed\n");
+        ret = av_read_frame(ic, &packet);
+        if (ret >= 0) {
+            gettimeofday(&decode_start, NULL);
+            ret = avcodec_decode_video2(pCodecCtx, pFrame, &frameFinished, &packet); //then we need to call frame_queue_push()
+            gettimeofday(&decode_end, NULL);
+            //av_packet_unref(&packet);
+            //ALOGD("avcodec_decode_video2() returns : %d \n", ret);
+            
+            if(frameFinished) {
+                //ALOGD("The frame is finished \n");
+
+				//pFrame->height = (pFrame->height);
+				
+				
+				
+				
+				int planes = av_pix_fmt_count_planes(pFrame->format);
+
+				//ALOGD("[AVFrame Debug] planes for frame %d is %d", frameIndex, planes);
+				//ALOGD("[AVFrame Debug] width = %d, and height = %d", pFrame->width, pFrame->height);
+				//ALOGD("[AVFrame Debug] format for frame %d is %d", frameIndex, pFrame->format);
+				
+				for(int i=0;i<planes;i++)
+				{
+					//ALOGD("[AVFrame Debug] sizeof data [%d] = %d", i, sizeof((pFrame->data)[i]));
+				}
+				
+				for(int i=0;i<planes;i++)
+				{
+					//ALOGD("[AVFrame Debug] linesize [%d] = %d", i, pFrame->linesize[i]);
+				}
+
+				/**
+				for(int i=0;i<planes;i++){
+				    for (int height=2048;height > 0; height--) {
+					         memcpy(frame->data[i], (pFrame->data)[i], 4096);
+					         frame->data[i] += frame->linesize[0];
+					         pFrame->data[i] += pFrame->linesize[0];
+				     }
+				}
+				
+				const uint8_t *src_data[4];
+				memcpy(src_data, pFrame->data, sizeof(src_data));
+				**/
+			    //av_frame_clone(frame, pFrame);
+				
+				/**
+				const uint8_t *src_data[4];
+				memcpy(src_data, pFrame->data, sizeof(src_data));
+					
+				AVFrame * frame = av_frame_alloc();
+
+				
+				
+				int bytes_num = avpicture_get_size(AV_PIX_FMT_YUYV422 , 4096, 2048); 
+				uint8_t * buff = (uint8_t * ) av_malloc(bytes_num);
+
+				
+				
+				
+				
+				
+				avpicture_fill((AVPicture * ) pFrame, buff, AV_PIX_FMT_YUYV422, 4096, 2048);
+				
+				frame->width = 4096;
+				frame->height =2048;
+				frame->linesize[0]=4096;
+				frame->linesize[1]=2048;
+				frame->linesize[2]=2048;
+				
+				
+				bytes_num = avpicture_get_size(AV_PIX_FMT_YUYV422 , 4096, 512); 
+				
+				memcpy(pFrame->data[0], src_data[0], bytes_num);
+				
+				**/
+				
+				
+				
+				/**
+				int bytes_num = avpicture_get_size(AV_PIX_FMT_YUYV422 , 4096, 512);
+				ALOGD("[AVFrame Debug] byte num of YUYV422 4096*512 = %d", bytes_num);
+				uint8_t * buff = (uint8_t * ) av_malloc(bytes_num);
+				memcpy(buff, pFrame->data[0], bytes_num);
+				ALOGD("[AVFrame Debug] data 2 - data 1 = %d", (pFrame->data[2]-pFrame->data[1]));
+				ALOGD("[AVFrame Debug] data 1 - data 0 = %d", (pFrame->data[1]-pFrame->data[0]));
+				
+				int bytes_num_2 = avpicture_get_size(AV_PIX_FMT_YUYV422 , 4096, 2048);
+				ALOGD("[AVFrame Debug] byte num of YUYV422 4096*2048 = %d", bytes_num_2);
+				uint8_t * buff_2 = (uint8_t * ) av_malloc(bytes_num_2);
+				
+				memcpy(buff_2, buff, bytes_num);
+				//memcpy(buff_2+bytes_num, buff, bytes_num);
+				//memcpy(buff_2+2*bytes_num, buff, bytes_num);
+				//memcpy(buff_2+3*bytes_num, buff, bytes_num);
+				
+				avpicture_fill((AVPicture * ) pFrame, buff_2, AV_PIX_FMT_YUYV422, 4096, 2048);
+				**/
+				
+				
+				/**
+
+				
+				
+				
+				int av_image_copy_to_buffer	(	uint8_t * 	dst,
+												int 	dst_size,
+												const uint8_t *const 	src_data[4],
+												const int 	src_linesize[4],
+												enum AVPixelFormat 	pix_fmt,
+												int 	width,
+												int 	height,
+												int 	align 
+											)	
+				**/
+				
+				
+				//ALOGD("[AVFrame Debug] Frame size (4096*2048) = %d", avpicture_get_size(AV_PIX_FMT_YUYV422 , 4096, 2048));
+				//ALOGD("[AVFrame Debug] Frame size (4096*512) = %d", avpicture_get_size(AV_PIX_FMT_YUYV422 , 4096, 512));
+				
+				//ALOGD("[AVFrame Debug] data 3 - data 2 = %d", (pFrame->data[3]-pFrame->data[2]));
+				//ALOGD("[AVFrame Debug] data 2 - data 1 = %d", (pFrame->data[2]-pFrame->data[1]));
+				//ALOGD("[AVFrame Debug] data 1 - data 0 = %d", (pFrame->data[1]-pFrame->data[0]));
+				
+				//ALOGD("[AVFrame Debug] frame->linesize[0] = %d", pFrame->linesize[0]);
+				//ALOGD("[AVFrame Debug] frame->linesize[1] = %d", pFrame->linesize[1]);
+				//ALOGD("[AVFrame Debug] frame->linesize[2] = %d", pFrame->linesize[2]);
+				//ALOGD("[AVFrame Debug] frame->linesize[3] = %d", pFrame->linesize[3]);
+				
+				
+
+				
+				uint8_t * buff_point;
+				buff_point=buff;
+				
+				//copy Y data
+				memcpy(buff_point, pFrame->data[0], pFrame->linesize[0]*512);
+				buff_point+=pFrame->linesize[0]*512;
+				memcpy(buff_point, pFrame->data[0], pFrame->linesize[0]*512);
+				buff_point+=pFrame->linesize[0]*512;
+				memcpy(buff_point, pFrame->data[0], pFrame->linesize[0]*512);
+				buff_point+=pFrame->linesize[0]*512;
+				memcpy(buff_point, pFrame->data[0], pFrame->linesize[0]*512);
+				buff_point+=pFrame->linesize[0]*512;
+				
+				//copy U data
+				memcpy(buff_point, pFrame->data[1], pFrame->linesize[1]*512/2);
+				buff_point+=pFrame->linesize[1]*512/2;
+				memcpy(buff_point, pFrame->data[1], pFrame->linesize[1]*512/2);
+				buff_point+=pFrame->linesize[1]*512/2;
+				memcpy(buff_point, pFrame->data[1], pFrame->linesize[1]*512/2);
+				buff_point+=pFrame->linesize[1]*512/2;
+				memcpy(buff_point, pFrame->data[1], pFrame->linesize[1]*512/2);
+				buff_point+=pFrame->linesize[1]*512/2;
+					  
+				//copy V data
+				memcpy(buff_point, pFrame->data[2], pFrame->linesize[2]*512/2);
+				buff_point+=pFrame->linesize[2]*512/2;	
+				memcpy(buff_point, pFrame->data[2], pFrame->linesize[2]*512/2);
+				buff_point+=pFrame->linesize[2]*512/2;
+				memcpy(buff_point, pFrame->data[2], pFrame->linesize[2]*512/2);
+				buff_point+=pFrame->linesize[2]*512/2;	
+				memcpy(buff_point, pFrame->data[2], pFrame->linesize[2]*512/2);
+				buff_point+=pFrame->linesize[2]*512/2;
+				
+				ALOGD("[AVFrame Debug] buff_point - buff = %d", (buff_point-buff));
+				/**
+				**Try to merge two AVFrames in a buffer
+				**/
+				
+				
+				
+				
+				
+				
+				//av_image_copy_to_buffer(buff, bytes_num, pFrame->data, pFrame->linesize, pFrame->format, 4096, 512, 32);
+				
+				
+				/**
+				av_image_fill_arrays	(	uint8_t * 	dst_data[4],
+											int 	dst_linesize[4],
+											const uint8_t * 	src,
+											enum AVPixelFormat 	pix_fmt,
+											int 	width,
+											int 	height,
+											int 	align 
+									 )	
+				**/
+				
+				av_image_fill_arrays(pFrame->data, pFrame->linesize, buff, pFrame->format, 4096, 2048, 32);
+				pFrame->width = 4096;
+				pFrame->height = 2048;
+				
+				
+				
+				//VRdisplay(ffp, pFrame, bmp);
+				//change to pipeline
+				SDL_LockMutex(subframe_num_lock);
+				subframe_num++;
+				SDL_CondSignal(display_thread_cond);
+				SDL_CondWait(read_thread_cond, subframe_num_lock);
+				SDL_UnlockMutex(subframe_num_lock);
+				
+				
+				
+				
+				
+				
+				
+				
+				
+				//av_frame_free(&buff);
+                
+				
+				//VRdisplay(ffp, av_frame_clone(pFrame), bmp);
+                // To employ pipline, we do not display here, we just put the frame into a buffer
+                /*
+                if (i < 16) {
+                    is->nearby_buffer[i] = pFrame;
+                    //i++;
+                }
+                else {
+                    ALOGD("Video: the buffer is full\n");
+                    is->move_req = 1;
+                    //SDL_LockMutex(ffp->is->play_mutex);
+                }*/ 
+            }
+            //is->move_req = 0; // Here we finish a move behavior
+        }
+        //gettimeofday(&end, NULL);
+        decode_timeuse = 1000000 * ( decode_end.tv_sec - decode_start.tv_sec ) + decode_end.tv_usec - decode_start.tv_usec;
+        printf("Video: The decoding time for frame %d is %d us\n", frameIndex, decode_timeuse);
+        /*
+        if (frameIndex < 240)
+            frameIndex += 16;
+        else
+            frameIndex = 0;
+        */
+		
+		//ALOGV("Orientation, id = %d", orien);
+		
+		
+		
+		
+
+		
+		
+        av_packet_unref(&packet);
+        //ALOGD("Video: loop number is %d \n", i);
+        i++;
+        //}
+    }
+  
+    printf("Video: Outside the loop \n");
+    // Free the YUV frame
+    av_frame_free(&pFrame);
+    av_frame_free(&buff);
+  
+    // Close the codecs
+    avcodec_close(pCodecCtx);
+    avcodec_close(pCodecCtxOrig);
+
+    // Close the video file
+    avformat_close_input(&ic);
+    
+    return 0;
+}
+
+
+
+
+//pull data from the Frame
+static void pull_Frame()
+{
+	SDL_LockMutex(Frame_lock);
+	//ALOGD("[Pipeline Debug pull_Frame] Point 1");
+	while(!Frame_occupied)
+	{
+		//ALOGD("[Pipeline Debug pull_Frame] Point 2");
+		SDL_CondWait(Frame_cond_pull, Frame_lock);
+		//ALOGD("[Pipeline Debug pull_Frame] Point 3");
+	}
+	//ALOGD("[Pipeline Debug pull_Frame] Point 4");
+	//pFrame_display=av_frame_clone(pFrame);
+	
+	int bytes_num = avpicture_get_size(12/**pFrame_part_1->format**/, 4096, 2048);
+	//memcpy(buff_display, buff, bytes_num);
+	pFrame->width = 4096;
+	pFrame->height = 2048;
+	pFrame->format = pFrame_part_1->format;
+	av_image_fill_arrays(pFrame->data, pFrame->linesize, buff , pFrame->format, 4096, 2048, 32);
+ 
+	//ALOGD("[Pipeline Debug pull_Frame] Point 5");
+	Frame_occupied = false;
+	SDL_CondSignal(Frame_cond_push);
+	SDL_UnlockMutex(Frame_lock);
+	//return pFrame_display;
+}
+
+
+
+
+//call this method to merge four frames
+static void merge_frames()
+{
+	
+	printf("\n Merging 4 P-frames");	
+	struct timeval last_time, current_time;
+
+	struct timeval merge_start, merge_end;
+	
+	struct timeval display_start, display_end;
+	
+	if(buff==NULL)
+	{
+		int bytes_num = avpicture_get_size(pFrame_part_1->format, 4096, 2048);
+		buff = (uint8_t * ) av_malloc(bytes_num);	
+		ALOGD("Allocate bytes for frame buffer");
+	}
+	
+	if(pFrame==NULL)
+	{
+		pFrame = av_frame_alloc();
+	}
+	
+
+	
+	//copy redundant data
+	if(true)
+	{
+		uint8_t * buff_point;
+		buff_point=buff;
+		
+		gettimeofday(&merge_start, NULL);
+		
+		
+		//copy Y data
+		memcpy(buff_point, pFrame_part_1->data[0], pFrame_part_1->linesize[0]*512);
+		buff_point+=pFrame_part_1->linesize[0]*512;
+		memcpy(buff_point, pFrame_part_2->data[0], pFrame_part_2->linesize[0]*512);
+		buff_point+=pFrame_part_2->linesize[0]*512;
+		
+		//memcpy(buff_point, pFrame_part_1->data[0], pFrame_part_1->linesize[0]*512);
+		//buff_point+=pFrame_part_1->linesize[0]*512;
+		//memcpy(buff_point, pFrame_part_2->data[0], pFrame_part_2->linesize[0]*512);
+		//buff_point+=pFrame_part_2->linesize[0]*512;
+		
+		
+		memcpy(buff_point, pFrame_part_3->data[0], pFrame_part_3->linesize[0]*512);
+		buff_point+=pFrame_part_3->linesize[0]*512;
+		memcpy(buff_point, pFrame_part_4->data[0], pFrame_part_4->linesize[0]*512);
+		buff_point+=pFrame_part_4->linesize[0]*512;
+		
+		//copy U data
+		//ALOGD("[AVFrame Debug] start to merge U data");
+		memcpy(buff_point, pFrame_part_1->data[1], pFrame_part_1->linesize[1]*512/2);
+		buff_point+=pFrame_part_1->linesize[1]*512/2;
+		memcpy(buff_point, pFrame_part_2->data[1], pFrame_part_2->linesize[1]*512/2);
+		buff_point+=pFrame_part_2->linesize[1]*512/2;
+		
+		//memcpy(buff_point, pFrame_part_1->data[1], pFrame_part_1->linesize[1]*512/2);
+		//buff_point+=pFrame_part_1->linesize[1]*512/2;
+		//memcpy(buff_point, pFrame_part_2->data[1], pFrame_part_2->linesize[1]*512/2);
+		//buff_point+=pFrame_part_2->linesize[1]*512/2;
+		
+		memcpy(buff_point, pFrame_part_3->data[1], pFrame_part_3->linesize[1]*512/2);
+		buff_point+=pFrame_part_3->linesize[1]*512/2;
+		memcpy(buff_point, pFrame_part_4->data[1], pFrame_part_4->linesize[1]*512/2);
+		buff_point+=pFrame_part_4->linesize[1]*512/2;
+		
+		//copy V data
+		//ALOGD("[AVFrame Debug] start to merge V data");
+		memcpy(buff_point, pFrame_part_1->data[2], pFrame_part_1->linesize[2]*512/2);
+		buff_point+=pFrame_part_1->linesize[2]*512/2;	
+		memcpy(buff_point, pFrame_part_2->data[2], pFrame_part_2->linesize[2]*512/2);
+		buff_point+=pFrame_part_2->linesize[2]*512/2;
+		
+		//memcpy(buff_point, pFrame_part_1->data[2], pFrame_part_1->linesize[2]*512/2);
+		//buff_point+=pFrame_part_1->linesize[2]*512/2;	
+		//memcpy(buff_point, pFrame_part_2->data[2], pFrame_part_2->linesize[2]*512/2);
+		//buff_point+=pFrame_part_2->linesize[2]*512/2;
+		
+		memcpy(buff_point, pFrame_part_3->data[2], pFrame_part_3->linesize[2]*512/2);
+		buff_point+=pFrame_part_3->linesize[2]*512/2;	
+		memcpy(buff_point, pFrame_part_4->data[2], pFrame_part_4->linesize[2]*512/2);
+		buff_point+=pFrame_part_4->linesize[2]*512/2;
+		
+		//ALOGD("[AVFrame Debug ] buff_point - buff = %d", (buff_point-buff));
+		/**
+		**Try to merge two AVFrames in a buffer
+		**/
+		
+		
+		
+		
+		
+		
+		//av_image_copy_to_buffer(buff, bytes_num, pFrame->data, pFrame->linesize, pFrame->format, 4096, 512, 32);
+		
+		
+		/**
+		av_image_fill_arrays	(	uint8_t * 	dst_data[4],
+		 int 	dst_linesize[4],
+		 const uint8_t * 	src,
+		 enum AVPixelFormat 	pix_fmt,
+		 int 	width,
+		 int 	height,
+		 int 	align 
+		   )	
+		**/
+		/**
+		av_image_fill_arrays(pFrame_part_1->data, pFrame_part_1->linesize, buff, pFrame_part_1->format, 4096, 2048, 32);
+		pFrame_part_1->width = 4096;
+		pFrame_part_1->height = 2048;
+		**/
+		
+
+		pFrame->width = 4096;
+		pFrame->height = 2048;
+		pFrame->format = pFrame_part_1->format;
+		av_image_fill_arrays(pFrame->data, pFrame->linesize, buff , pFrame->format, 4096, 2048, 32);
+		//av_image_fill_arrays(pFrame->data, pFrame->linesize, buff, pFrame->format, 4096, 2048, 32);
+		
+		gettimeofday(&merge_end, NULL);
+		printf("[Merge Frame: %d us]",(1000000 * ( merge_end.tv_sec - merge_start.tv_sec ) + merge_end.tv_usec - merge_start.tv_usec));
+	}
+	
+}
+
+
+
+
+/** the thread used to receive a decoded frame and display it **/
+static int display_thread(void *arg)
+{
+
+    //ijkplayer
+	FFPlayer *ffp = arg;
+	
+	{
+		
+	struct timeval last_time, current_time;
+
+	struct timeval merge_start, merge_end;
+	
+	struct timeval display_start, display_end;
+	
+	ALOGD("[Parallel Debug] start display_thread.");
+	
+	gettimeofday(&last_time, NULL);
+	
+
+	
+	while(true)
+	{
+		
+
+		SDL_LockMutex(subframe_num_lock);
+		while(subframe_num!=4)
+		{
+		   printf("Dead lock Debug, Loop, Before SDL Wait, subframe_num=%d",subframe_num);
+		   
+			
+			//SDL_CondWaitTimeout(display_thread_cond, subframe_num_lock, 10);
+			//SDL_CondBroadcast(read_thread_cond);
+            SDL_CondWait(display_thread_cond, subframe_num_lock);
+		   
+			
+			//ALOGD("Dead lock Debug, Loop, continue to loop After SDL Wait");
+		}
+		subframe_num=0;
+		//ALOGD("Dead lock Debug, Loop, get out of to loop After SDL Wait");
+		
+		
+		//SDL_CondSignal(read_thread_cond);
+
+		
+		
+		SDL_UnlockMutex(subframe_num_lock);
+		
+		
+		merge_frames();
+		
+		SDL_LockMutex(read_thread_lock);
+		//ALOGD("Dead lock Debug, after loop call SDL_CondBroadcast to start decoding thread");
+		SDL_CondBroadcast(read_thread_cond);
+		SDL_UnlockMutex(read_thread_lock);
+		
+		//ALOGD("Dead lock Debug, Loop, Before VRdisplay");
+		
+		
+		
+		if(buff==NULL)
+		{
+			int bytes_num = avpicture_get_size(12/**pFrame_part_1->format**/, 4096, 2048);
+			buff = (uint8_t * ) av_malloc(bytes_num);	
+			//ALOGD("Allocate bytes for frame buffer");
+		}
+		
+		if(buff_display==NULL)
+		{
+			int bytes_num = avpicture_get_size(12/**pFrame_part_1->format**/, 4096, 2048);
+			buff_display = (uint8_t * ) av_malloc(bytes_num);	
+			//ALOGD("Allocate bytes for display frame buffer");
+		}
+		
+		
+		
+		if(pFrame==NULL)
+		{
+		   pFrame = av_frame_alloc();
+		}
+	
+		
+		
+		
+display:
+		
+		printf("[Parallel Debug:] before call pull_Frame");
+		//pull_Frame();
+		
+		gettimeofday(&current_time, NULL);
+		//ALOGD("[Frame Interval: %d]",(1000000 * ( current_time.tv_sec - last_time.tv_sec ) + current_time.tv_usec - last_time.tv_usec));
+		last_time = current_time;
+		
+		
+		gettimeofday(&display_start, NULL);
+		VRdisplay(ffp, pFrame , bmp);
+		gettimeofday(&display_end, NULL);
+		
+		printf("[Display Debug: %d us ]",(1000000 * ( display_end.tv_sec - display_start.tv_sec ) + display_end.tv_usec - display_start.tv_usec));
+
+ 
+		SDL_LockMutex(subframe_num_lock);
+		if(subframe_num_lock==4)
+		{
+		   ALOGD("Dead lock Debug, subframe_num_lock==4, Call SDL_CondBroadcast");
+		   SDL_CondBroadcast(read_thread_cond);
+		   //ALOGD("Dead lock Debug, Loop, Before SDL Wait");
+		}
+		SDL_UnlockMutex(subframe_num_lock);
+		//SDL_CondBroadcast(read_thread_cond);
+
+ 
+		
+	}
+	}
+	return 0;
+}
+
+
+
+
+
+//push data to the Frame
+static void push_Frame()
+{
+	SDL_LockMutex(Frame_lock);
+	//ALOGD("[Pipeline Debug push_Frame] Point 1");
+	while(Frame_occupied)
+	{
+		//ALOGD("[Pipeline Debug push_Frame] Point 2");
+		SDL_CondWait(Frame_cond_push, Frame_lock);
+		//ALOGD("[Pipeline Debug push_Frame] Point 3");
+	}
+	//ALOGD("[Pipeline Debug push_Frame] Point 4");
+	Frame_occupied= true;
+	merge_frames();
+	SDL_CondSignal(Frame_cond_pull);
+	SDL_UnlockMutex(Frame_lock);
+}
+
+// We define another thread to achieve video frame's random access, decode and display together, which is sequnetial
+static int read_thread_part_1(void *arg)
+{
+    //ijkplayer
+    printf("\n we are in read_thread_part_1");
+    FFPlayer *ffp = arg;
+    VideoState *is = ffp->is;
+    AVFormatContext *ic = NULL;
+    double pts;
+    double duration;
+    //SDL_VoutOverlay *bmp;  
+
+    //ffmpeg
+    int               i, videoStream;
+    AVCodecContext    *pCodecCtxOrig = NULL;
+    AVCodecContext    *pCodecCtx = NULL;
+    AVCodec           *pCodec = NULL;
+    //AVFrame           *pFrame = NULL;
+    AVPacket          packet;
+    int               frameFinished;
+
+    struct timeval decode_start, decode_end, seek_start, seek_end;
+    int frameIndex = 0;
+    //long msec = (1000 * frameIndex) / 64;
+    int ret;
+    long msec;
+    int64_t seekTarget;
+    int seek_timeuse, decode_timeuse;
+
+    //ALOGD("Video: The read_thread is executed now!!!\n");
+    // Register all formats and codecs
+    av_register_all();
+
+    ic = avformat_alloc_context();
+    if(!ic){
+        ALOGD("Video: avformat_alloc_context() failed!!!\n");
+        return -1;
+    }
+    ic->interrupt_callback.callback = decode_interrupt_cb;
+    ic->interrupt_callback.opaque = is;
+
+    // Open video file
+    //if(avformat_open_input(&ic, is->filename_part_2, NULL, NULL)!=0) {
+	char *path="/sdcard/P1_video/viking_4K_128Frames_Part_1_P.mp4";
+	//char *path="/sdcard/P1_video/viking_part_1.mp4";
+	if(avformat_open_input(&ic, path, NULL, NULL)!=0) {
+        ALOGD("Video: Couldn't open file\n");
+        return -1;
+    } 
+
+    // Retrieve stream information
+    if(avformat_find_stream_info(ic, NULL)<0) {
+        ALOGD("Video: Couldn't find stream information\n");
+        return -1;
+    }
+
+    // Dump information about file onto standard error
+    //av_dump_format(ic, 0, is->filename, 0);
+    av_dump_format(ic, 0, path, 0);
+
+    videoStream=-1;
+    for(i=0; i<ic->nb_streams; i++) {
+        if(ic->streams[i]->codec->codec_type==AVMEDIA_TYPE_VIDEO) {
+            videoStream=i;
+            break;
+        }
+    }
+    if(videoStream==-1) {
+        ALOGD("Video: Didn't find a video stream\n");
+        return -1;
+    }
+
+    // Get a pointer to the codec context for the video stream
+    pCodecCtxOrig=ic->streams[videoStream]->codec;
+
+    // Find the decoder for the video stream
+    pCodec = avcodec_find_decoder(pCodecCtxOrig->codec_id);
+
+    // Copy context
+    pCodecCtx = avcodec_alloc_context3(pCodec);
+
+    if(avcodec_copy_context(pCodecCtx, pCodecCtxOrig) != 0) {
+        ALOGD(stderr, "Couldn't copy codec context");
+        return -1; // Error copying codec context
+    }
+
+    // Open codec
+    if(avcodec_open2(pCodecCtx, pCodec, NULL)<0) {
+        ALOGD("Video: Could not open codec\n");
+        return -1;
+    }
+
+    // Allocate video frame
+    pFrame_part_1 = av_frame_alloc();
+    ALOGD("Video: Break point 1\n");
+
+
+
+    // Now matter what function we employed, we read and decode the I frame first
+    av_read_frame(ic, &packet);
+
+    ret = avcodec_decode_video2(pCodecCtx, pFrame_part_1, &frameFinished, &packet);
+
+	/**
+	SDL_VoutSetOverlayFormat(ffp->vout, ffp->overlay_format);
+    bmp = SDL_Vout_CreateOverlay(
+			        4096,//pFrame->width,
+					2048,//(pFrame->height)*4,
+					12,//pFrame->format,
+                    ffp->vout);
+	**/
+	
+    /*ALOGD("avcodec_decode_video2() returns : %d \n", ret);
+    if (frameFinished){
+        ALOGD("The frame is finished \n");
+        VRdisplay(ffp, pFrame);
+    }    
+    else
+        ALOGD("Frame is not finished \n");*/
+
+	
+    if (is->video_st && is->video_st->codecpar) {
+        AVCodecParameters *codecpar = is->video_st->codecpar;
+        ffp_notify_msg3(ffp, FFP_MSG_VIDEO_SIZE_CHANGED, codecpar->width, codecpar->height);
+        ffp_notify_msg3(ffp, FFP_MSG_SAR_CHANGED, codecpar->sample_aspect_ratio.num, codecpar->sample_aspect_ratio.den);
+    }
+	
+	ffp->prepared = true;
+    ffp_notify_msg1(ffp, FFP_MSG_PREPARED);
+	ffp_notify_msg3(ffp, FFP_MSG_BUFFERING_UPDATE, 100, 100);
+	
+    i = 0;
+	
+
+	
+
+	
+    while(!is->abort_request){      
+        // Now, we achieve the random access using av_seek_frame()
+        //if (is->move_req) {
+        //frameIndex = is->move_pos;
+        //gettimeofday(&start, NULL);
+		
+		
+		/** modification **/
+		
+		
+		/* set direction according to controller */
+		frameIndex = frameIndex + orien;
+		if (frameIndex < 0)
+			frameIndex = frame_num;
+		
+		if (frameIndex > frame_num)
+			frameIndex = 0;
+
+		
+		/** modification **/
+		
+		
+		
+		
+        msec = (1000 * frameIndex) / 64;
+        //long msec = (1000 * is->move_pos) / 64;
+        seekTarget = milliseconds_to_fftime(msec);
+        gettimeofday(&seek_start, NULL);
+        ret = avformat_seek_file(ic, -1, INT64_MIN, seekTarget, INT64_MAX, AVSEEK_FLAG_ANY);
+        gettimeofday(&seek_end, NULL);
+        seek_timeuse = 1000000 * ( seek_end.tv_sec - seek_start.tv_sec ) + seek_end.tv_usec - seek_start.tv_usec;
+        //ALOGD("Video: The seeking time for frame %d is %d us\n", frameIndex, seek_timeuse);
+        //ALOGD("Viedo: avformat_seek_file() returns %d \n", ret);
+        if(ret < 0)
+            ALOGD("Video: avformat_seek_file() failed\n");
+        ret = av_read_frame(ic, &packet);
+        if (ret >= 0) {
+            gettimeofday(&decode_start, NULL);
+            ret = avcodec_decode_video2(pCodecCtx, pFrame_part_1, &frameFinished, &packet); //then we need to call frame_queue_push()
+            gettimeofday(&decode_end, NULL);
+            //av_packet_unref(&packet);
+            //ALOGD("avcodec_decode_video2() returns : %d \n", ret);
+            
+            if(frameFinished) {
+                //ALOGD("The frame is finished \n");
+
+				//pFrame->height = (pFrame->height);
+				
+				
+				
+				
+				int planes = av_pix_fmt_count_planes(pFrame_part_1->format);
+
+				//ALOGD("[AVFrame Debug 1] planes for frame %d is %d", frameIndex, planes);
+				//ALOGD("[AVFrame Debug 1] width = %d, and height = %d", pFrame_part_1->width, pFrame_part_1->height);
+				//ALOGD("[AVFrame Debug 1] format for frame %d is %d", frameIndex, pFrame_part_1->format);
+				
+				for(int i=0;i<planes;i++)
+				{
+					//ALOGD("[AVFrame Debug 1] sizeof data [%d] = %d", i, sizeof((pFrame_part_1->data)[i]));
+				}
+				
+				for(int i=0;i<planes;i++)
+				{
+					//ALOGD("[AVFrame Debug 1] linesize [%d] = %d", i, pFrame_part_1->linesize[i]);
+				}
+
+				/**
+				for(int i=0;i<planes;i++){
+				    for (int height=2048;height > 0; height--) {
+					         memcpy(frame->data[i], (pFrame->data)[i], 4096);
+					         frame->data[i] += frame->linesize[0];
+					         pFrame->data[i] += pFrame->linesize[0];
+				     }
+				}
+				
+				const uint8_t *src_data[4];
+				memcpy(src_data, pFrame->data, sizeof(src_data));
+				**/
+			    //av_frame_clone(frame, pFrame);
+				
+				/**
+				const uint8_t *src_data[4];
+				memcpy(src_data, pFrame->data, sizeof(src_data));
+					
+				AVFrame * frame = av_frame_alloc();
+
+				
+				
+				int bytes_num = avpicture_get_size(AV_PIX_FMT_YUYV422 , 4096, 2048); 
+				uint8_t * buff = (uint8_t * ) av_malloc(bytes_num);
+
+				
+				
+				
+				
+				
+				avpicture_fill((AVPicture * ) pFrame, buff, AV_PIX_FMT_YUYV422, 4096, 2048);
+				
+				frame->width = 4096;
+				frame->height =2048;
+				frame->linesize[0]=4096;
+				frame->linesize[1]=2048;
+				frame->linesize[2]=2048;
+				
+				
+				bytes_num = avpicture_get_size(AV_PIX_FMT_YUYV422 , 4096, 512); 
+				
+				memcpy(pFrame->data[0], src_data[0], bytes_num);
+				
+				**/
+				
+				
+				
+				/**
+				int bytes_num = avpicture_get_size(AV_PIX_FMT_YUYV422 , 4096, 512);
+				ALOGD("[AVFrame Debug] byte num of YUYV422 4096*512 = %d", bytes_num);
+				uint8_t * buff = (uint8_t * ) av_malloc(bytes_num);
+				memcpy(buff, pFrame->data[0], bytes_num);
+				ALOGD("[AVFrame Debug] data 2 - data 1 = %d", (pFrame->data[2]-pFrame->data[1]));
+				ALOGD("[AVFrame Debug] data 1 - data 0 = %d", (pFrame->data[1]-pFrame->data[0]));
+				
+				int bytes_num_2 = avpicture_get_size(AV_PIX_FMT_YUYV422 , 4096, 2048);
+				ALOGD("[AVFrame Debug] byte num of YUYV422 4096*2048 = %d", bytes_num_2);
+				uint8_t * buff_2 = (uint8_t * ) av_malloc(bytes_num_2);
+				
+				memcpy(buff_2, buff, bytes_num);
+				//memcpy(buff_2+bytes_num, buff, bytes_num);
+				//memcpy(buff_2+2*bytes_num, buff, bytes_num);
+				//memcpy(buff_2+3*bytes_num, buff, bytes_num);
+				
+				avpicture_fill((AVPicture * ) pFrame, buff_2, AV_PIX_FMT_YUYV422, 4096, 2048);
+				**/
+				
+				
+				/**
+
+				
+				
+				
+				int av_image_copy_to_buffer	(	uint8_t * 	dst,
+												int 	dst_size,
+												const uint8_t *const 	src_data[4],
+												const int 	src_linesize[4],
+												enum AVPixelFormat 	pix_fmt,
+												int 	width,
+												int 	height,
+												int 	align 
+											)	
+				**/
+				
+				
+				//ALOGD("[AVFrame Debug 1] Frame size (4096*2048) = %d", avpicture_get_size(AV_PIX_FMT_YUYV422 , 4096, 2048));
+				//ALOGD("[AVFrame Debug 1] Frame size (4096*512) = %d", avpicture_get_size(AV_PIX_FMT_YUYV422 , 4096, 512));
+				
+				//ALOGD("[AVFrame Debug 1] data 3 - data 2 = %d", (pFrame_part_1->data[3]-pFrame_part_1->data[2]));
+				//ALOGD("[AVFrame Debug 1] data 2 - data 1 = %d", (pFrame_part_1->data[2]-pFrame_part_1->data[1]));
+				//ALOGD("[AVFrame Debug 1] data 1 - data 0 = %d", (pFrame_part_1->data[1]-pFrame_part_1->data[0]));
+				
+				//ALOGD("[AVFrame Debug 1] frame->linesize[0] = %d", pFrame_part_1->linesize[0]);
+				//ALOGD("[AVFrame Debug 1] frame->linesize[1] = %d", pFrame_part_1->linesize[1]);
+				//ALOGD("[AVFrame Debug 1] frame->linesize[2] = %d", pFrame_part_1->linesize[2]);
+				//ALOGD("[AVFrame Debug 1] frame->linesize[3] = %d", pFrame_part_1->linesize[3]);
+				
+
+				
+				//copy redundant data
+				if(false)
+				{
+				
+				uint8_t * buff_point;
+				buff_point=buff;
+				
+				//copy Y data
+				memcpy(buff_point, pFrame->data[0], pFrame->linesize[0]*512);
+				buff_point+=pFrame->linesize[0]*512;
+				memcpy(buff_point, pFrame->data[0], pFrame->linesize[0]*512);
+				buff_point+=pFrame->linesize[0]*512;
+				memcpy(buff_point, pFrame->data[0], pFrame->linesize[0]*512);
+				buff_point+=pFrame->linesize[0]*512;
+				memcpy(buff_point, pFrame->data[0], pFrame->linesize[0]*512);
+				buff_point+=pFrame->linesize[0]*512;
+				
+				//copy U data
+				memcpy(buff_point, pFrame->data[1], pFrame->linesize[1]*512/2);
+				buff_point+=pFrame->linesize[1]*512/2;
+				memcpy(buff_point, pFrame->data[1], pFrame->linesize[1]*512/2);
+				buff_point+=pFrame->linesize[1]*512/2;
+				memcpy(buff_point, pFrame->data[1], pFrame->linesize[1]*512/2);
+				buff_point+=pFrame->linesize[1]*512/2;
+				memcpy(buff_point, pFrame->data[1], pFrame->linesize[1]*512/2);
+				buff_point+=pFrame->linesize[1]*512/2;
+					  
+				//copy V data
+				memcpy(buff_point, pFrame->data[2], pFrame->linesize[2]*512/2);
+				buff_point+=pFrame->linesize[2]*512/2;	
+				memcpy(buff_point, pFrame->data[2], pFrame->linesize[2]*512/2);
+				buff_point+=pFrame->linesize[2]*512/2;
+				memcpy(buff_point, pFrame->data[2], pFrame->linesize[2]*512/2);
+				buff_point+=pFrame->linesize[2]*512/2;	
+				memcpy(buff_point, pFrame->data[2], pFrame->linesize[2]*512/2);
+				buff_point+=pFrame->linesize[2]*512/2;
+				
+				//ALOGD("[AVFrame Debug 1] buff_point - buff = %d", (buff_point-buff));
+				
+				/**
+				**Try to merge two AVFrames in a buffer
+				**/
+				
+				
+				
+				
+				
+				
+				//av_image_copy_to_buffer(buff, bytes_num, pFrame->data, pFrame->linesize, pFrame->format, 4096, 512, 32);
+				
+				
+				/**
+				av_image_fill_arrays	(	uint8_t * 	dst_data[4],
+											int 	dst_linesize[4],
+											const uint8_t * 	src,
+											enum AVPixelFormat 	pix_fmt,
+											int 	width,
+											int 	height,
+											int 	align 
+									 )	
+				**/
+				
+				av_image_fill_arrays(pFrame->data, pFrame->linesize, buff, pFrame->format, 4096, 2048, 32);
+				pFrame->width = 4096;
+				pFrame->height = 2048;
+			}
+				
+				
+				//VRdisplay(ffp, pFrame, bmp);
+				//change to pipeline
+			SDL_LockMutex(subframe_num_lock);
+			//ALOGD("Dead lock Debug Part 1 Point 1");
+			subframe_num++;
+			//ALOGD("[Dead lock Debug] Thread 1, decoded a new frame subframe_num = %d",subframe_num);
+			//ALOGD("Dead lock Debug Part 1 Point 2");
+			//if(subframe_num==4)
+			{
+				//merge_frames();
+  			    //SDL_CondSignal(display_thread_cond);
+				//subframe_num=0;
+				//merge_frames();	
+				
+				
+				//SDL_UnlockMutex(subframe_num_lock);
+
+				//SDL_CondBroadcast(read_thread_cond);
+ 
+				//continue;
+				//SDL_UnlockMutex(subframe_num_lock);
+				//push_Frame();
+				//SDL_CondSignal(read_thread_cond);
+				//continue;
+			}
+			//ALOGD("Dead lock Debug Part 1 Point 3");
+			SDL_UnlockMutex(subframe_num_lock);
+			//ALOGD("Dead lock Debug Part 2 Point 4");
+			
+ 
+			SDL_LockMutex(read_thread_lock);
+			//ALOGD("Dead lock Debug Part 1 SDL_CondSignal(display_thread_cond)");
+			SDL_CondSignal(display_thread_cond);
+			//ALOGD("Dead lock Debug Part 1 is blocking  Before SDL_CondWait");
+			SDL_CondWait(read_thread_cond, read_thread_lock);
+			//ALOGD("Dead lock Debug Part 1 is resuming After SDL_CondWait");
+			SDL_UnlockMutex(read_thread_lock);
+			//ALOGD("Dead lock Debug Part 1 Point 7");
+			
+			
+			/**
+			decode_timeuse = 1000000 * ( decode_end.tv_sec - decode_start.tv_sec ) + decode_end.tv_usec - decode_start.tv_usec;
+			ALOGD("[Decoding Debug] Thread 1 The decoding time for frame %d is %d us\n", frameIndex, decode_timeuse);
+			
+			continue;
+				
+check_Frame: 
+			{
+				SDL_LockMutex(Frame_lock);
+				
+				while(Frame_occupied)
+				{
+					SDL_CondWait(Frame_cond, Frame_lock);
+				}
+				Frame_occupied=true;
+				SDL_UnlockMutex(Frame_lock);
+				SDL_CondBroadcast(read_thread_cond);
+				continue;
+			}
+				
+				
+				**/
+				
+				
+				
+				//av_frame_free(&buff);
+                
+				
+				//VRdisplay(ffp, av_frame_clone(pFrame), bmp);
+                // To employ pipline, we do not display here, we just put the frame into a buffer
+                /*
+                if (i < 16) {
+                    is->nearby_buffer[i] = pFrame;
+                    //i++;
+                }
+                else {
+                    ALOGD("Video: the buffer is full\n");
+                    is->move_req = 1;
+                    //SDL_LockMutex(ffp->is->play_mutex);
+                }*/ 
+            }
+            //is->move_req = 0; // Here we finish a move behavior
+        }
+        //gettimeofday(&end, NULL);
+        decode_timeuse = 1000000 * ( decode_end.tv_sec - decode_start.tv_sec ) + decode_end.tv_usec - decode_start.tv_usec;
+        printf("[Decoding Debug] Thread 1 The decoding time for frame %d is %d us\n", frameIndex, decode_timeuse);
+        /*
+        if (frameIndex < 240)
+            frameIndex += 16;
+        else
+            frameIndex = 0;
+        */
+		
+		//ALOGV("Orientation, id = %d", orien);
+		
+		
+		
+		
+
+		
+		
+        av_packet_unref(&packet);
+        //ALOGD("Video: loop number is %d \n", i);
+        i++;
+        //}
+    }
+  
+    ALOGD("Video: Outside the loop \n");
+    // Free the YUV frame
+    av_frame_free(&pFrame);
+    av_frame_free(&buff);
+  
+    // Close the codecs
+    avcodec_close(pCodecCtx);
+    avcodec_close(pCodecCtxOrig);
+
+    // Close the video file
+    avformat_close_input(&ic);
+    
+    return 0;
+}
+
+
+
+// We define another thread to achieve video frame's random access, decode and display together, which is sequnetial
+static int read_thread_part_2(void *arg)
+{
+    //ijkplayer
+    printf("\n we are in read_thread_part_2");
+    FFPlayer *ffp = arg;
+    VideoState *is = ffp->is;
+    AVFormatContext *ic = NULL;
+    double pts;
+    double duration;
+    //SDL_VoutOverlay *bmp;  
+
+    //ffmpeg
+    int               i, videoStream;
+    AVCodecContext    *pCodecCtxOrig = NULL;
+    AVCodecContext    *pCodecCtx = NULL;
+    AVCodec           *pCodec = NULL;
+    //AVFrame           *pFrame = NULL;
+    AVPacket          packet;
+    int               frameFinished;
+
+    struct timeval decode_start, decode_end, seek_start, seek_end;
+    int frameIndex = 0;
+    //long msec = (1000 * frameIndex) / 64;
+    int ret;
+    long msec;
+    int64_t seekTarget;
+    int seek_timeuse, decode_timeuse;
+
+    printf("Video: The read_thread is executed now!!!\n");
+    // Register all formats and codecs
+    av_register_all();
+
+    ic = avformat_alloc_context();
+    if(!ic){
+        ALOGD("Video: avformat_alloc_context() failed!!!\n");
+        return -1;
+    }
+    ic->interrupt_callback.callback = decode_interrupt_cb;
+    ic->interrupt_callback.opaque = is;
+
+    // Open video file
+    //if(avformat_open_input(&ic, is->filename_part_2, NULL, NULL)!=0) {
+	char *path="/sdcard/P1_video/viking_4K_128Frames_Part_2_P.mp4";
+	//char *path="/sdcard/P1_video/viking_part_2.mp4";
+	if(avformat_open_input(&ic, path, NULL, NULL)!=0) {
+        ALOGD("Video: Couldn't open file\n");
+        return -1;
+    } 
+
+    // Retrieve stream information
+    if(avformat_find_stream_info(ic, NULL)<0) {
+        ALOGD("Video: Couldn't find stream information\n");
+        return -1;
+    }
+
+    // Dump information about file onto standard error
+    av_dump_format(ic, 0, is->filename, 0);
+
+    videoStream=-1;
+    for(i=0; i<ic->nb_streams; i++) {
+        if(ic->streams[i]->codec->codec_type==AVMEDIA_TYPE_VIDEO) {
+            videoStream=i;
+            break;
+        }
+    }
+    if(videoStream==-1) {
+        ALOGD("Video: Didn't find a video stream\n");
+        return -1;
+    }
+
+    // Get a pointer to the codec context for the video stream
+    pCodecCtxOrig=ic->streams[videoStream]->codec;
+
+    // Find the decoder for the video stream
+    pCodec = avcodec_find_decoder(pCodecCtxOrig->codec_id);
+
+    // Copy context
+    pCodecCtx = avcodec_alloc_context3(pCodec);
+
+    if(avcodec_copy_context(pCodecCtx, pCodecCtxOrig) != 0) {
+        ALOGD(stderr, "Couldn't copy codec context");
+        return -1; // Error copying codec context
+    }
+
+    // Open codec
+    if(avcodec_open2(pCodecCtx, pCodec, NULL)<0) {
+        ALOGD("Video: Could not open codec\n");
+        return -1;
+    }
+
+    // Allocate video frame
+    pFrame_part_2 = av_frame_alloc();
+    ALOGD("Video: Break point 1\n");
+
+
+
+    // Now matter what function we employed, we read and decode the I frame first
+    av_read_frame(ic, &packet);
+
+    ret = avcodec_decode_video2(pCodecCtx, pFrame_part_2, &frameFinished, &packet);
+
+	/**
+	SDL_VoutSetOverlayFormat(ffp->vout, ffp->overlay_format);
+    bmp = SDL_Vout_CreateOverlay(
+			  4096,//pFrame->width,
+		2048,//(pFrame->height)*4,
+		12,//pFrame->format,
+                    ffp->vout);
+	**/
+	
+    /*ALOGD("avcodec_decode_video2() returns : %d \n", ret);
+    if (frameFinished){
+        ALOGD("The frame is finished \n");
+        VRdisplay(ffp, pFrame);
+    }    
+    else
+        ALOGD("Frame is not finished \n");*/
+
+	
+    if (is->video_st && is->video_st->codecpar) {
+        AVCodecParameters *codecpar = is->video_st->codecpar;
+        ffp_notify_msg3(ffp, FFP_MSG_VIDEO_SIZE_CHANGED, codecpar->width, codecpar->height);
+        ffp_notify_msg3(ffp, FFP_MSG_SAR_CHANGED, codecpar->sample_aspect_ratio.num, codecpar->sample_aspect_ratio.den);
+    }
+	
+	ffp->prepared = true;
+    ffp_notify_msg1(ffp, FFP_MSG_PREPARED);
+	ffp_notify_msg3(ffp, FFP_MSG_BUFFERING_UPDATE, 100, 100);
+	
+    i = 0;
+	
+
+	
+
+	
+    while(!is->abort_request){      
+        // Now, we achieve the random access using av_seek_frame()
+        //if (is->move_req) {
+        //frameIndex = is->move_pos;
+        //gettimeofday(&start, NULL);
+		
+		
+		/** modification **/
+		
+		
+		/* set direction according to controller */
+		frameIndex = frameIndex + orien;
+		if (frameIndex < 0)
+			frameIndex = frame_num;
+		
+		if (frameIndex > frame_num)
+			frameIndex = 0;
+
+		
+		/** modification **/
+		
+		
+		
+		
+        msec = (1000 * frameIndex) / 64;
+        //long msec = (1000 * is->move_pos) / 64;
+        seekTarget = milliseconds_to_fftime(msec);
+        gettimeofday(&seek_start, NULL);
+        ret = avformat_seek_file(ic, -1, INT64_MIN, seekTarget, INT64_MAX, AVSEEK_FLAG_ANY);
+        gettimeofday(&seek_end, NULL);
+        seek_timeuse = 1000000 * ( seek_end.tv_sec - seek_start.tv_sec ) + seek_end.tv_usec - seek_start.tv_usec;
+        //ALOGD("Video: The seeking time for frame %d is %d us\n", frameIndex, seek_timeuse);
+        //ALOGD("Viedo: avformat_seek_file() returns %d \n", ret);
+        if(ret < 0)
+            ALOGD("Video: avformat_seek_file() failed\n");
+        ret = av_read_frame(ic, &packet);
+        if (ret >= 0) {
+            gettimeofday(&decode_start, NULL);
+            ret = avcodec_decode_video2(pCodecCtx, pFrame_part_2, &frameFinished, &packet); //then we need to call frame_queue_push()
+            gettimeofday(&decode_end, NULL);
+            //av_packet_unref(&packet);
+            //ALOGD("avcodec_decode_video2() returns : %d \n", ret);
+            
+            if(frameFinished) {
+                //ALOGD("The frame is finished \n");
+
+				//pFrame->height = (pFrame->height);
+				
+				
+				
+				
+				int planes = av_pix_fmt_count_planes(pFrame_part_2->format);
+
+				ALOGD("[AVFrame Debug 2] planes for frame %d is %d", frameIndex, planes);
+				ALOGD("[AVFrame Debug 2] width = %d, and height = %d", pFrame_part_2->width, pFrame_part_2->height);
+				ALOGD("[AVFrame Debug 2] format for frame %d is %d", frameIndex, pFrame_part_2->format);
+				
+				for(int i=0;i<planes;i++)
+				{
+					ALOGD("[AVFrame Debug 2] sizeof data [%d] = %d", i, sizeof((pFrame_part_2->data)[i]));
+				}
+				
+				for(int i=0;i<planes;i++)
+				{
+					ALOGD("[AVFrame Debug 2] linesize [%d] = %d", i, pFrame_part_2->linesize[i]);
+				}
+
+				/**
+				for(int i=0;i<planes;i++){
+				    for (int height=2048;height > 0; height--) {
+						  memcpy(frame->data[i], (pFrame->data)[i], 4096);
+						  frame->data[i] += frame->linesize[0];
+						  pFrame->data[i] += pFrame->linesize[0];
+				     }
+				}
+				 
+				const uint8_t *src_data[4];
+				memcpy(src_data, pFrame->data, sizeof(src_data));
+				**/
+			    //av_frame_clone(frame, pFrame);
+				
+				/**
+				const uint8_t *src_data[4];
+				memcpy(src_data, pFrame->data, sizeof(src_data));
+				  
+				AVFrame * frame = av_frame_alloc();
+
+				 
+				 
+				int bytes_num = avpicture_get_size(AV_PIX_FMT_YUYV422 , 4096, 2048); 
+				uint8_t * buff = (uint8_t * ) av_malloc(bytes_num);
+
+				 
+				 
+				 
+				 
+				 
+				avpicture_fill((AVPicture * ) pFrame, buff, AV_PIX_FMT_YUYV422, 4096, 2048);
+				 
+				frame->width = 4096;
+				frame->height =2048;
+				frame->linesize[0]=4096;
+				frame->linesize[1]=2048;
+				frame->linesize[2]=2048;
+				 
+				 
+				bytes_num = avpicture_get_size(AV_PIX_FMT_YUYV422 , 4096, 512); 
+				 
+				memcpy(pFrame->data[0], src_data[0], bytes_num);
+				 
+				**/
+				
+				
+				
+				/**
+				int bytes_num = avpicture_get_size(AV_PIX_FMT_YUYV422 , 4096, 512);
+				ALOGD("[AVFrame Debug] byte num of YUYV422 4096*512 = %d", bytes_num);
+				uint8_t * buff = (uint8_t * ) av_malloc(bytes_num);
+				memcpy(buff, pFrame->data[0], bytes_num);
+				ALOGD("[AVFrame Debug] data 2 - data 1 = %d", (pFrame->data[2]-pFrame->data[1]));
+				ALOGD("[AVFrame Debug] data 1 - data 0 = %d", (pFrame->data[1]-pFrame->data[0]));
+				 
+				int bytes_num_2 = avpicture_get_size(AV_PIX_FMT_YUYV422 , 4096, 2048);
+				ALOGD("[AVFrame Debug] byte num of YUYV422 4096*2048 = %d", bytes_num_2);
+				uint8_t * buff_2 = (uint8_t * ) av_malloc(bytes_num_2);
+				 
+				memcpy(buff_2, buff, bytes_num);
+				//memcpy(buff_2+bytes_num, buff, bytes_num);
+				//memcpy(buff_2+2*bytes_num, buff, bytes_num);
+				//memcpy(buff_2+3*bytes_num, buff, bytes_num);
+				 
+				avpicture_fill((AVPicture * ) pFrame, buff_2, AV_PIX_FMT_YUYV422, 4096, 2048);
+				**/
+				
+				
+				/**
+
+				 
+				 
+				 
+				int av_image_copy_to_buffer	(	uint8_t * 	dst,
+						int 	dst_size,
+						const uint8_t *const 	src_data[4],
+						const int 	src_linesize[4],
+						enum AVPixelFormat 	pix_fmt,
+						int 	width,
+						int 	height,
+						int 	align 
+					   )	
+				**/
+				
+				
+				//ALOGD("[AVFrame Debug 2] Frame size (4096*2048) = %d", avpicture_get_size(AV_PIX_FMT_YUYV422 , 4096, 2048));
+				//ALOGD("[AVFrame Debug 2] Frame size (4096*512) = %d", avpicture_get_size(AV_PIX_FMT_YUYV422 , 4096, 512));
+				
+				//ALOGD("[AVFrame Debug 2] data 3 - data 2 = %d", (pFrame_part_2->data[3]-pFrame_part_2->data[2]));
+				//ALOGD("[AVFrame Debug 2] data 2 - data 1 = %d", (pFrame_part_2->data[2]-pFrame_part_2->data[1]));
+				//ALOGD("[AVFrame Debug 2] data 1 - data 0 = %d", (pFrame_part_2->data[1]-pFrame_part_2->data[0]));
+				
+				//ALOGD("[AVFrame Debug 2] frame->linesize[0] = %d", pFrame_part_2->linesize[0]);
+				//ALOGD("[AVFrame Debug 2] frame->linesize[1] = %d", pFrame_part_2->linesize[1]);
+				//ALOGD("[AVFrame Debug 2] frame->linesize[2] = %d", pFrame_part_2->linesize[2]);
+				//ALOGD("[AVFrame Debug 2] frame->linesize[3] = %d", pFrame_part_2->linesize[3]);
+				
+
+				
+				//copy redundant data
+				if(false)
+				{
+					
+					uint8_t * buff_point;
+					buff_point=buff;
+					
+					//copy Y data
+					memcpy(buff_point, pFrame->data[0], pFrame->linesize[0]*512);
+					buff_point+=pFrame->linesize[0]*512;
+					memcpy(buff_point, pFrame->data[0], pFrame->linesize[0]*512);
+					buff_point+=pFrame->linesize[0]*512;
+					memcpy(buff_point, pFrame->data[0], pFrame->linesize[0]*512);
+					buff_point+=pFrame->linesize[0]*512;
+					memcpy(buff_point, pFrame->data[0], pFrame->linesize[0]*512);
+					buff_point+=pFrame->linesize[0]*512;
+					
+					//copy U data
+					memcpy(buff_point, pFrame->data[1], pFrame->linesize[1]*512/2);
+					buff_point+=pFrame->linesize[1]*512/2;
+					memcpy(buff_point, pFrame->data[1], pFrame->linesize[1]*512/2);
+					buff_point+=pFrame->linesize[1]*512/2;
+					memcpy(buff_point, pFrame->data[1], pFrame->linesize[1]*512/2);
+					buff_point+=pFrame->linesize[1]*512/2;
+					memcpy(buff_point, pFrame->data[1], pFrame->linesize[1]*512/2);
+					buff_point+=pFrame->linesize[1]*512/2;
+					
+					//copy V data
+					memcpy(buff_point, pFrame->data[2], pFrame->linesize[2]*512/2);
+					buff_point+=pFrame->linesize[2]*512/2;	
+					memcpy(buff_point, pFrame->data[2], pFrame->linesize[2]*512/2);
+					buff_point+=pFrame->linesize[2]*512/2;
+					memcpy(buff_point, pFrame->data[2], pFrame->linesize[2]*512/2);
+					buff_point+=pFrame->linesize[2]*512/2;	
+					memcpy(buff_point, pFrame->data[2], pFrame->linesize[2]*512/2);
+					buff_point+=pFrame->linesize[2]*512/2;
+					
+					//ALOGD("[AVFrame Debug 2] buff_point - buff = %d", (buff_point-buff));
+					
+					/**
+					**Try to merge two AVFrames in a buffer
+					**/
+					
+					
+					
+					
+					
+					
+					//av_image_copy_to_buffer(buff, bytes_num, pFrame->data, pFrame->linesize, pFrame->format, 4096, 512, 32);
+					
+					
+					/**
+					av_image_fill_arrays	(	uint8_t * 	dst_data[4],
+						   int 	dst_linesize[4],
+						   const uint8_t * 	src,
+						   enum AVPixelFormat 	pix_fmt,
+						   int 	width,
+						   int 	height,
+						   int 	align 
+						  )	
+					**/
+					
+					av_image_fill_arrays(pFrame->data, pFrame->linesize, buff, pFrame->format, 4096, 2048, 32);
+					pFrame->width = 4096;
+					pFrame->height = 2048;
+				}
+				
+				
+				//VRdisplay(ffp, pFrame, bmp);
+				//change to pipeline
+				SDL_LockMutex(subframe_num_lock);
+				//ALOGD("Dead lock Debug Part 2 Point 1");
+				subframe_num++;
+				//ALOGD("[Dead lock Debug] Thread 2, decoded a new frame subframe_num = %d",subframe_num);
+				
+				//ALOGD("Dead lock Debug Part 2 Point 2");
+				//if(subframe_num==4)
+				{
+					//merge_frames();
+					//SDL_CondSignal(display_thread_cond);
+					//subframe_num=0;
+					//merge_frames();		
+					
+					
+					//SDL_UnlockMutex(subframe_num_lock);
+
+					//SDL_CondBroadcast(read_thread_cond);
+					
+					//continue;
+					//SDL_UnlockMutex(subframe_num_lock);
+					//push_Frame();
+					//SDL_CondSignal(read_thread_cond);
+					//continue;
+				}
+				//ALOGD("Dead lock Debug Part 2 Point 3");
+				SDL_UnlockMutex(subframe_num_lock);
+				//ALOGD("Dead lock Debug Part 2 Point 4");
+				
+
+				SDL_LockMutex(read_thread_lock);
+				//ALOGD("Dead lock Debug Part 2 SDL_CondSignal(display_thread_cond)");
+				SDL_CondSignal(display_thread_cond);
+				//ALOGD("Dead lock Debug Part 2 is blocking Before SDL_CondWait");
+				SDL_CondWait(read_thread_cond, read_thread_lock);
+				//ALOGD("Dead lock Debug Part 2 is resuming After SDL_CondWait");
+				SDL_UnlockMutex(read_thread_lock);
+				//ALOGD("Dead lock Debug Part 2 Point 7");
+				
+				
+				
+				
+				
+				
+				
+				
+				//av_frame_free(&buff);
+                
+				
+				//VRdisplay(ffp, av_frame_clone(pFrame), bmp);
+                // To employ pipline, we do not display here, we just put the frame into a buffer
+                /*
+                if (i < 16) {
+                    is->nearby_buffer[i] = pFrame;
+                    //i++;
+                }
+                else {
+                    ALOGD("Video: the buffer is full\n");
+                    is->move_req = 1;
+                    //SDL_LockMutex(ffp->is->play_mutex);
+                }*/ 
+            }
+            //is->move_req = 0; // Here we finish a move behavior
+        }
+        //gettimeofday(&end, NULL);
+        decode_timeuse = 1000000 * ( decode_end.tv_sec - decode_start.tv_sec ) + decode_end.tv_usec - decode_start.tv_usec;
+        //ALOGD("[Decoding Debug] Thread 2 The decoding time for frame %d is %d us\n", frameIndex, decode_timeuse);
+        
+		/*
+        if (frameIndex < 240)
+            frameIndex += 16;
+        else
+            frameIndex = 0;
+        */
+		
+		//ALOGV("Orientation, id = %d", orien);
+		
+		
+		
+		
+
+		
+		
+        av_packet_unref(&packet);
+        //ALOGD("Video: loop number is %d \n", i);
+        i++;
+        //}
+    }
+	
+    ALOGD("Video: Outside the loop \n");
+    // Free the YUV frame
+    av_frame_free(&pFrame);
+    av_frame_free(&buff);
+	
+    // Close the codecs
+    avcodec_close(pCodecCtx);
+    avcodec_close(pCodecCtxOrig);
+
+    // Close the video file
+    avformat_close_input(&ic);
+    
+    return 0;
+}
+
+
+
+
+// We define another thread to achieve video frame's random access, decode and display together, which is sequnetial
+static int read_thread_part_3(void *arg)
+{
+    //ijkplayer
+    printf("\n we are in read_thread_part_3");
+    FFPlayer *ffp = arg;
+    VideoState *is = ffp->is;
+    AVFormatContext *ic = NULL;
+    double pts;
+    double duration;
+    //SDL_VoutOverlay *bmp;  
+
+    //ffmpeg
+    int               i, videoStream;
+    AVCodecContext    *pCodecCtxOrig = NULL;
+    AVCodecContext    *pCodecCtx = NULL;
+    AVCodec           *pCodec = NULL;
+    //AVFrame           *pFrame = NULL;
+    AVPacket          packet;
+    int               frameFinished;
+
+    struct timeval decode_start, decode_end, seek_start, seek_end;
+    int frameIndex = 0;
+    //long msec = (1000 * frameIndex) / 64;
+    int ret;
+    long msec;
+    int64_t seekTarget;
+    int seek_timeuse, decode_timeuse;
+
+    printf("Video: The read_thread is executed now!!!\n");
+    // Register all formats and codecs
+    av_register_all();
+
+    ic = avformat_alloc_context();
+    if(!ic){
+        ALOGD("Video: avformat_alloc_context() failed!!!\n");
+        return -1;
+    }
+    ic->interrupt_callback.callback = decode_interrupt_cb;
+    ic->interrupt_callback.opaque = is;
+
+    // Open video file
+    //if(avformat_open_input(&ic, is->filename_part_2, NULL, NULL)!=0) {
+	char *path="/sdcard/P1_video/viking_4K_128Frames_Part_3_P.mp4";
+	//char *path="/sdcard/P1_video/viking_part_3.mp4";
+	if(avformat_open_input(&ic, path, NULL, NULL)!=0) {
+        ALOGD("Video: Couldn't open file\n");
+        return -1;
+    } 
+
+    // Retrieve stream information
+    if(avformat_find_stream_info(ic, NULL)<0) {
+        ALOGD("Video: Couldn't find stream information\n");
+        return -1;
+    }
+
+    // Dump information about file onto standard error
+    av_dump_format(ic, 0, is->filename, 0);
+
+    videoStream=-1;
+    for(i=0; i<ic->nb_streams; i++) {
+        if(ic->streams[i]->codec->codec_type==AVMEDIA_TYPE_VIDEO) {
+            videoStream=i;
+            break;
+        }
+    }
+    if(videoStream==-1) {
+        ALOGD("Video: Didn't find a video stream\n");
+        return -1;
+    }
+
+    // Get a pointer to the codec context for the video stream
+    pCodecCtxOrig=ic->streams[videoStream]->codec;
+
+    // Find the decoder for the video stream
+    pCodec = avcodec_find_decoder(pCodecCtxOrig->codec_id);
+
+    // Copy context
+    pCodecCtx = avcodec_alloc_context3(pCodec);
+
+    if(avcodec_copy_context(pCodecCtx, pCodecCtxOrig) != 0) {
+        ALOGD(stderr, "Couldn't copy codec context");
+        return -1; // Error copying codec context
+    }
+
+    // Open codec
+    if(avcodec_open2(pCodecCtx, pCodec, NULL)<0) {
+        ALOGD("Video: Could not open codec\n");
+        return -1;
+    }
+
+    // Allocate video frame
+    pFrame_part_3 = av_frame_alloc();
+    ALOGD("Video: Break point 1\n");
+
+
+
+    // Now matter what function we employed, we read and decode the I frame first
+    av_read_frame(ic, &packet);
+
+    ret = avcodec_decode_video2(pCodecCtx, pFrame_part_3, &frameFinished, &packet);
+
+	/**
+	SDL_VoutSetOverlayFormat(ffp->vout, ffp->overlay_format);
+    bmp = SDL_Vout_CreateOverlay(
+		4096,//pFrame->width,
+	 2048,//(pFrame->height)*4,
+	 12,//pFrame->format,
+                    ffp->vout);
+	**/
+	
+    /*ALOGD("avcodec_decode_video2() returns : %d \n", ret);
+    if (frameFinished){
+        ALOGD("The frame is finished \n");
+        VRdisplay(ffp, pFrame);
+    }    
+    else
+        ALOGD("Frame is not finished \n");*/
+
+	
+    if (is->video_st && is->video_st->codecpar) {
+        AVCodecParameters *codecpar = is->video_st->codecpar;
+        ffp_notify_msg3(ffp, FFP_MSG_VIDEO_SIZE_CHANGED, codecpar->width, codecpar->height);
+        ffp_notify_msg3(ffp, FFP_MSG_SAR_CHANGED, codecpar->sample_aspect_ratio.num, codecpar->sample_aspect_ratio.den);
+    }
+	
+	ffp->prepared = true;
+    ffp_notify_msg1(ffp, FFP_MSG_PREPARED);
+	ffp_notify_msg3(ffp, FFP_MSG_BUFFERING_UPDATE, 100, 100);
+	
+    i = 0;
+	
+
+	
+
+	
+    while(!is->abort_request){      
+        // Now, we achieve the random access using av_seek_frame()
+        //if (is->move_req) {
+        //frameIndex = is->move_pos;
+        //gettimeofday(&start, NULL);
+		
+		
+		/** modification **/
+		
+		
+		/* set direction according to controller */
+		frameIndex = frameIndex + orien;
+		if (frameIndex < 0)
+			frameIndex = frame_num;
+		
+		if (frameIndex > frame_num)
+			frameIndex = 0;
+
+		
+		/** modification **/
+		
+		
+		
+		
+        msec = (1000 * frameIndex) / 64;
+        //long msec = (1000 * is->move_pos) / 64;
+        seekTarget = milliseconds_to_fftime(msec);
+        gettimeofday(&seek_start, NULL);
+        ret = avformat_seek_file(ic, -1, INT64_MIN, seekTarget, INT64_MAX, AVSEEK_FLAG_ANY);
+        gettimeofday(&seek_end, NULL);
+        seek_timeuse = 1000000 * ( seek_end.tv_sec - seek_start.tv_sec ) + seek_end.tv_usec - seek_start.tv_usec;
+        //ALOGD("Video: The seeking time for frame %d is %d us\n", frameIndex, seek_timeuse);
+        //ALOGD("Viedo: avformat_seek_file() returns %d \n", ret);
+        if(ret < 0)
+            ALOGD("Video: avformat_seek_file() failed\n");
+        ret = av_read_frame(ic, &packet);
+        if (ret >= 0) {
+            gettimeofday(&decode_start, NULL);
+            ret = avcodec_decode_video2(pCodecCtx, pFrame_part_3, &frameFinished, &packet); //then we need to call frame_queue_push()
+            gettimeofday(&decode_end, NULL);
+            //av_packet_unref(&packet);
+            //ALOGD("avcodec_decode_video2() returns : %d \n", ret);
+            
+            if(frameFinished) {
+                //ALOGD("The frame is finished \n");
+
+				//pFrame->height = (pFrame->height);
+				
+				
+				
+				
+				int planes = av_pix_fmt_count_planes(pFrame_part_3->format);
+
+				//ALOGD("[AVFrame Debug 2] planes for frame %d is %d", frameIndex, planes);
+				//ALOGD("[AVFrame Debug 2] width = %d, and height = %d", pFrame_part_3->width, pFrame_part_3->height);
+				//ALOGD("[AVFrame Debug 2] format for frame %d is %d", frameIndex, pFrame_part_3->format);
+				
+				for(int i=0;i<planes;i++)
+				{
+					//ALOGD("[AVFrame Debug 2] sizeof data [%d] = %d", i, sizeof((pFrame_part_3->data)[i]));
+				}
+				
+				for(int i=0;i<planes;i++)
+				{
+					//ALOGD("[AVFrame Debug 2] linesize [%d] = %d", i, pFrame_part_3->linesize[i]);
+				}
+
+				/**
+				for(int i=0;i<planes;i++){
+				    for (int height=2048;height > 0; height--) {
+					memcpy(frame->data[i], (pFrame->data)[i], 4096);
+					frame->data[i] += frame->linesize[0];
+					pFrame->data[i] += pFrame->linesize[0];
+				     }
+				}
+				  
+				const uint8_t *src_data[4];
+				memcpy(src_data, pFrame->data, sizeof(src_data));
+				**/
+			    //av_frame_clone(frame, pFrame);
+				
+				/**
+				const uint8_t *src_data[4];
+				memcpy(src_data, pFrame->data, sizeof(src_data));
+				   
+				AVFrame * frame = av_frame_alloc();
+
+				  
+				  
+				int bytes_num = avpicture_get_size(AV_PIX_FMT_YUYV422 , 4096, 2048); 
+				uint8_t * buff = (uint8_t * ) av_malloc(bytes_num);
+
+				  
+				  
+				  
+				  
+				  
+				avpicture_fill((AVPicture * ) pFrame, buff, AV_PIX_FMT_YUYV422, 4096, 2048);
+				  
+				frame->width = 4096;
+				frame->height =2048;
+				frame->linesize[0]=4096;
+				frame->linesize[1]=2048;
+				frame->linesize[2]=2048;
+				  
+				  
+				bytes_num = avpicture_get_size(AV_PIX_FMT_YUYV422 , 4096, 512); 
+				  
+				memcpy(pFrame->data[0], src_data[0], bytes_num);
+				  
+				**/
+				
+				
+				
+				/**
+				int bytes_num = avpicture_get_size(AV_PIX_FMT_YUYV422 , 4096, 512);
+				ALOGD("[AVFrame Debug] byte num of YUYV422 4096*512 = %d", bytes_num);
+				uint8_t * buff = (uint8_t * ) av_malloc(bytes_num);
+				memcpy(buff, pFrame->data[0], bytes_num);
+				ALOGD("[AVFrame Debug] data 2 - data 1 = %d", (pFrame->data[2]-pFrame->data[1]));
+				ALOGD("[AVFrame Debug] data 1 - data 0 = %d", (pFrame->data[1]-pFrame->data[0]));
+				  
+				int bytes_num_2 = avpicture_get_size(AV_PIX_FMT_YUYV422 , 4096, 2048);
+				ALOGD("[AVFrame Debug] byte num of YUYV422 4096*2048 = %d", bytes_num_2);
+				uint8_t * buff_2 = (uint8_t * ) av_malloc(bytes_num_2);
+				  
+				memcpy(buff_2, buff, bytes_num);
+				//memcpy(buff_2+bytes_num, buff, bytes_num);
+				//memcpy(buff_2+2*bytes_num, buff, bytes_num);
+				//memcpy(buff_2+3*bytes_num, buff, bytes_num);
+				  
+				avpicture_fill((AVPicture * ) pFrame, buff_2, AV_PIX_FMT_YUYV422, 4096, 2048);
+				**/
+				
+				
+				/**
+
+				  
+				  
+				  
+				int av_image_copy_to_buffer	(	uint8_t * 	dst,
+				  int 	dst_size,
+				  const uint8_t *const 	src_data[4],
+				  const int 	src_linesize[4],
+				  enum AVPixelFormat 	pix_fmt,
+				  int 	width,
+				  int 	height,
+				  int 	align 
+					)	
+				**/
+				
+				
+				//ALOGD("[AVFrame Debug 3] Frame size (4096*2048) = %d", avpicture_get_size(AV_PIX_FMT_YUYV422 , 4096, 2048));
+				//ALOGD("[AVFrame Debug 3] Frame size (4096*512) = %d", avpicture_get_size(AV_PIX_FMT_YUYV422 , 4096, 512));
+				
+				//ALOGD("[AVFrame Debug 3] data 3 - data 2 = %d", (pFrame_part_3->data[3]-pFrame_part_3->data[2]));
+				//ALOGD("[AVFrame Debug 3] data 2 - data 1 = %d", (pFrame_part_3->data[2]-pFrame_part_3->data[1]));
+				//ALOGD("[AVFrame Debug 3] data 1 - data 0 = %d", (pFrame_part_3->data[1]-pFrame_part_3->data[0]));
+				
+				//ALOGD("[AVFrame Debug 3] frame->linesize[0] = %d", pFrame_part_3->linesize[0]);
+				//ALOGD("[AVFrame Debug 3] frame->linesize[1] = %d", pFrame_part_3->linesize[1]);
+				//ALOGD("[AVFrame Debug 3] frame->linesize[2] = %d", pFrame_part_3->linesize[2]);
+				//ALOGD("[AVFrame Debug 3] frame->linesize[3] = %d", pFrame_part_3->linesize[3]);
+				
+
+				
+				//copy redundant data
+				if(false)
+				{
+					
+					uint8_t * buff_point;
+					buff_point=buff;
+					
+					//copy Y data
+					memcpy(buff_point, pFrame->data[0], pFrame->linesize[0]*512);
+					buff_point+=pFrame->linesize[0]*512;
+					memcpy(buff_point, pFrame->data[0], pFrame->linesize[0]*512);
+					buff_point+=pFrame->linesize[0]*512;
+					memcpy(buff_point, pFrame->data[0], pFrame->linesize[0]*512);
+					buff_point+=pFrame->linesize[0]*512;
+					memcpy(buff_point, pFrame->data[0], pFrame->linesize[0]*512);
+					buff_point+=pFrame->linesize[0]*512;
+					
+					//copy U data
+					memcpy(buff_point, pFrame->data[1], pFrame->linesize[1]*512/2);
+					buff_point+=pFrame->linesize[1]*512/2;
+					memcpy(buff_point, pFrame->data[1], pFrame->linesize[1]*512/2);
+					buff_point+=pFrame->linesize[1]*512/2;
+					memcpy(buff_point, pFrame->data[1], pFrame->linesize[1]*512/2);
+					buff_point+=pFrame->linesize[1]*512/2;
+					memcpy(buff_point, pFrame->data[1], pFrame->linesize[1]*512/2);
+					buff_point+=pFrame->linesize[1]*512/2;
+					
+					//copy V data
+					memcpy(buff_point, pFrame->data[2], pFrame->linesize[2]*512/2);
+					buff_point+=pFrame->linesize[2]*512/2;	
+					memcpy(buff_point, pFrame->data[2], pFrame->linesize[2]*512/2);
+					buff_point+=pFrame->linesize[2]*512/2;
+					memcpy(buff_point, pFrame->data[2], pFrame->linesize[2]*512/2);
+					buff_point+=pFrame->linesize[2]*512/2;	
+					memcpy(buff_point, pFrame->data[2], pFrame->linesize[2]*512/2);
+					buff_point+=pFrame->linesize[2]*512/2;
+					
+					ALOGD("[AVFrame Debug 3] buff_point - buff = %d", (buff_point-buff));
+					/**
+					**Try to merge two AVFrames in a buffer
+					**/
+					
+					
+					
+					
+					
+					
+					//av_image_copy_to_buffer(buff, bytes_num, pFrame->data, pFrame->linesize, pFrame->format, 4096, 512, 32);
+					
+					
+					/**
+					av_image_fill_arrays	(	uint8_t * 	dst_data[4],
+						int 	dst_linesize[4],
+						const uint8_t * 	src,
+						enum AVPixelFormat 	pix_fmt,
+						int 	width,
+						int 	height,
+						int 	align 
+					   )	
+					**/
+					
+					av_image_fill_arrays(pFrame->data, pFrame->linesize, buff, pFrame->format, 4096, 2048, 32);
+					pFrame->width = 4096;
+					pFrame->height = 2048;
+				}
+				
+				
+				//VRdisplay(ffp, pFrame, bmp);
+				//change to pipeline
+				SDL_LockMutex(subframe_num_lock);
+				//ALOGD("Dead lock Debug Part 2 Point 1");
+				subframe_num++;
+				//ALOGD("[Dead lock Debug] Thread 3, decoded a new frame subframe_num = %d",subframe_num);
+				//ALOGD("Dead lock Debug Part 2 Point 2");
+				//if(subframe_num==4)
+				{
+					//merge_frames();
+					//SDL_CondSignal(display_thread_cond);
+					//subframe_num=0;
+					//merge_frames();		 
+					
+					
+					//SDL_UnlockMutex(subframe_num_lock);
+
+					//SDL_CondBroadcast(read_thread_cond);
+					
+					//continue;
+					//SDL_UnlockMutex(subframe_num_lock);
+					//push_Frame();
+					//SDL_CondSignal(read_thread_cond);
+					//continue;
+				}
+				//ALOGD("Dead lock Debug Part 2 Point 3");
+				SDL_UnlockMutex(subframe_num_lock);
+				//ALOGD("Dead lock Debug Part 2 Point 4");
+				
+
+				SDL_LockMutex(read_thread_lock);
+				//ALOGD("Dead lock Debug Part 3 SDL_CondSignal(display_thread_cond)");
+				SDL_CondSignal(display_thread_cond);
+				//ALOGD("Dead lock Debug Part 3 is blocking Before SDL_CondWait");
+				SDL_CondWait(read_thread_cond, read_thread_lock);
+				//ALOGD("Dead lock Debug Part 3 is resuming After SDL_CondWait");
+				SDL_UnlockMutex(read_thread_lock);
+				//ALOGD("Dead lock Debug Part 2 Point 7");
+				
+				
+				
+				
+				
+				
+				
+				
+				//av_frame_free(&buff);
+                
+				
+				//VRdisplay(ffp, av_frame_clone(pFrame), bmp);
+                // To employ pipline, we do not display here, we just put the frame into a buffer
+                /*
+                if (i < 16) {
+                    is->nearby_buffer[i] = pFrame;
+                    //i++;
+                }
+                else {
+                    ALOGD("Video: the buffer is full\n");
+                    is->move_req = 1;
+                    //SDL_LockMutex(ffp->is->play_mutex);
+                }*/ 
+            }
+            //is->move_req = 0; // Here we finish a move behavior
+        }
+        //gettimeofday(&end, NULL);
+        decode_timeuse = 1000000 * ( decode_end.tv_sec - decode_start.tv_sec ) + decode_end.tv_usec - decode_start.tv_usec;
+        //ALOGD("[Decoding Debug] Thread 3 The decoding time for frame %d is %d us\n", frameIndex, decode_timeuse);
+        /*
+        if (frameIndex < 240)
+            frameIndex += 16;
+        else
+            frameIndex = 0;
+        */
+		
+		//ALOGV("Orientation, id = %d", orien);
+		
+		
+		
+		
+
+		
+		
+        av_packet_unref(&packet);
+        //ALOGD("Video: loop number is %d \n", i);
+        i++;
+        //}
+    }
+	
+    //ALOGD("Video: Outside the loop \n");
+    // Free the YUV frame
+    av_frame_free(&pFrame);
+    av_frame_free(&buff);
+	
+    // Close the codecs
+    avcodec_close(pCodecCtx);
+    avcodec_close(pCodecCtxOrig);
+
+    // Close the video file
+    avformat_close_input(&ic);
+    
+    return 0;
+}
+
+
+
+// We define another thread to achieve video frame's random access, decode and display together, which is sequnetial
+static int read_thread_part_4(void *arg)
+{
+    //ijkplayer
+    printf("\n we are in read_thread_part_4");
+    FFPlayer *ffp = arg;
+    VideoState *is = ffp->is;
+    AVFormatContext *ic = NULL;
+    double pts;
+    double duration;
+    //SDL_VoutOverlay *bmp;  
+
+    //ffmpeg
+    int               i, videoStream;
+    AVCodecContext    *pCodecCtxOrig = NULL;
+    AVCodecContext    *pCodecCtx = NULL;
+    AVCodec           *pCodec = NULL;
+    //AVFrame           *pFrame = NULL;
+    AVPacket          packet;
+    int               frameFinished;
+
+    struct timeval decode_start, decode_end, seek_start, seek_end;
+    int frameIndex = 0;
+    //long msec = (1000 * frameIndex) / 64;
+    int ret;
+    long msec;
+    int64_t seekTarget;
+    int seek_timeuse, decode_timeuse;
+
+    ALOGD("Video: The read_thread is executed now!!!\n");
+    // Register all formats and codecs
+    av_register_all();
+
+    ic = avformat_alloc_context();
+    if(!ic){
+        ALOGD("Video: avformat_alloc_context() failed!!!\n");
+        return -1;
+    }
+    ic->interrupt_callback.callback = decode_interrupt_cb;
+    ic->interrupt_callback.opaque = is;
+
+    // Open video file
+    //if(avformat_open_input(&ic, is->filename_part_2, NULL, NULL)!=0) {
+	char *path="/sdcard/P1_video/viking_4K_128Frames_Part_4_P.mp4";
+	//char *path="/sdcard/P1_video/viking_part_4.mp4";
+	if(avformat_open_input(&ic, path, NULL, NULL)!=0) {
+        ALOGD("Video: Couldn't open file\n");
+        return -1;
+    } 
+
+    // Retrieve stream information
+    if(avformat_find_stream_info(ic, NULL)<0) {
+        ALOGD("Video: Couldn't find stream information\n");
+        return -1;
+    }
+
+    // Dump information about file onto standard error
+    av_dump_format(ic, 0, is->filename, 0);
+
+    videoStream=-1;
+    for(i=0; i<ic->nb_streams; i++) {
+        if(ic->streams[i]->codec->codec_type==AVMEDIA_TYPE_VIDEO) {
+            videoStream=i;
+            break;
+        }
+    }
+    if(videoStream==-1) {
+        ALOGD("Video: Didn't find a video stream\n");
+        return -1;
+    }
+
+    // Get a pointer to the codec context for the video stream
+    pCodecCtxOrig=ic->streams[videoStream]->codec;
+
+    // Find the decoder for the video stream
+    pCodec = avcodec_find_decoder(pCodecCtxOrig->codec_id);
+
+    // Copy context
+    pCodecCtx = avcodec_alloc_context3(pCodec);
+
+    if(avcodec_copy_context(pCodecCtx, pCodecCtxOrig) != 0) {
+        ALOGD(stderr, "Couldn't copy codec context");
+        return -1; // Error copying codec context
+    }
+
+    // Open codec
+    if(avcodec_open2(pCodecCtx, pCodec, NULL)<0) {
+        ALOGD("Video: Could not open codec\n");
+        return -1;
+    }
+
+    // Allocate video frame
+    pFrame_part_4 = av_frame_alloc();
+    ALOGD("Video: Break point 1\n");
+
+
+
+    // Now matter what function we employed, we read and decode the I frame first
+    av_read_frame(ic, &packet);
+
+    ret = avcodec_decode_video2(pCodecCtx, pFrame_part_4, &frameFinished, &packet);
+
+	/**
+	SDL_VoutSetOverlayFormat(ffp->vout, ffp->overlay_format);
+    bmp = SDL_Vout_CreateOverlay(
+		4096,//pFrame->width,
+	 2048,//(pFrame->height)*4,
+	 12,//pFrame->format,
+                    ffp->vout);
+	**/
+	
+    /*ALOGD("avcodec_decode_video2() returns : %d \n", ret);
+    if (frameFinished){
+        ALOGD("The frame is finished \n");
+        VRdisplay(ffp, pFrame);
+    }    
+    else
+        ALOGD("Frame is not finished \n");*/
+
+	
+    if (is->video_st && is->video_st->codecpar) {
+        AVCodecParameters *codecpar = is->video_st->codecpar;
+        ffp_notify_msg3(ffp, FFP_MSG_VIDEO_SIZE_CHANGED, codecpar->width, codecpar->height);
+        ffp_notify_msg3(ffp, FFP_MSG_SAR_CHANGED, codecpar->sample_aspect_ratio.num, codecpar->sample_aspect_ratio.den);
+    }
+	
+	ffp->prepared = true;
+    ffp_notify_msg1(ffp, FFP_MSG_PREPARED);
+	ffp_notify_msg3(ffp, FFP_MSG_BUFFERING_UPDATE, 100, 100);
+	
+    i = 0;
+	
+
+	
+
+	
+    while(!is->abort_request){      
+        // Now, we achieve the random access using av_seek_frame()
+        //if (is->move_req) {
+        //frameIndex = is->move_pos;
+        //gettimeofday(&start, NULL);
+		
+		
+		/** modification **/
+		
+		
+		/* set direction according to controller */
+		frameIndex = frameIndex + orien;
+		if (frameIndex < 0)
+			frameIndex = frame_num;
+		
+		if (frameIndex > frame_num)
+			frameIndex = 0;
+
+		
+		/** modification **/
+		
+		
+		
+		
+        msec = (1000 * frameIndex) / 64;
+        //long msec = (1000 * is->move_pos) / 64;
+        seekTarget = milliseconds_to_fftime(msec);
+        gettimeofday(&seek_start, NULL);
+        ret = avformat_seek_file(ic, -1, INT64_MIN, seekTarget, INT64_MAX, AVSEEK_FLAG_ANY);
+        gettimeofday(&seek_end, NULL);
+        seek_timeuse = 1000000 * ( seek_end.tv_sec - seek_start.tv_sec ) + seek_end.tv_usec - seek_start.tv_usec;
+        //ALOGD("Video: The seeking time for frame %d is %d us\n", frameIndex, seek_timeuse);
+        //ALOGD("Viedo: avformat_seek_file() returns %d \n", ret);
+        if(ret < 0)
+            ALOGD("Video: avformat_seek_file() failed\n");
+        ret = av_read_frame(ic, &packet);
+        if (ret >= 0) {
+            gettimeofday(&decode_start, NULL);
+            ret = avcodec_decode_video2(pCodecCtx, pFrame_part_4, &frameFinished, &packet); //then we need to call frame_queue_push()
+            gettimeofday(&decode_end, NULL);
+            //av_packet_unref(&packet);
+            //ALOGD("avcodec_decode_video2() returns : %d \n", ret);
+            
+            if(frameFinished) {
+                //ALOGD("The frame is finished \n");
+
+				//pFrame->height = (pFrame->height);
+				
+				
+				
+				
+				int planes = av_pix_fmt_count_planes(pFrame_part_4->format);
+
+				//ALOGD("[AVFrame Debug 2] planes for frame %d is %d", frameIndex, planes);
+				//ALOGD("[AVFrame Debug 2] width = %d, and height = %d", pFrame_part_4->width, pFrame_part_4->height);
+				//ALOGD("[AVFrame Debug 2] format for frame %d is %d", frameIndex, pFrame_part_4->format);
+				
+				for(int i=0;i<planes;i++)
+				{
+					//ALOGD("[AVFrame Debug 2] sizeof data [%d] = %d", i, sizeof((pFrame_part_4->data)[i]));
+				}
+				
+				for(int i=0;i<planes;i++)
+				{
+					//ALOGD("[AVFrame Debug 2] linesize [%d] = %d", i, pFrame_part_4->linesize[i]);
+				}
+
+				/**
+				for(int i=0;i<planes;i++){
+				    for (int height=2048;height > 0; height--) {
+					memcpy(frame->data[i], (pFrame->data)[i], 4096);
+					frame->data[i] += frame->linesize[0];
+					pFrame->data[i] += pFrame->linesize[0];
+				     }
+				}
+				  
+				const uint8_t *src_data[4];
+				memcpy(src_data, pFrame->data, sizeof(src_data));
+				**/
+			    //av_frame_clone(frame, pFrame);
+				
+				/**
+				const uint8_t *src_data[4];
+				memcpy(src_data, pFrame->data, sizeof(src_data));
+				   
+				AVFrame * frame = av_frame_alloc();
+
+				  
+				  
+				int bytes_num = avpicture_get_size(AV_PIX_FMT_YUYV422 , 4096, 2048); 
+				uint8_t * buff = (uint8_t * ) av_malloc(bytes_num);
+
+				  
+				  
+				  
+				  
+				  
+				avpicture_fill((AVPicture * ) pFrame, buff, AV_PIX_FMT_YUYV422, 4096, 2048);
+				  
+				frame->width = 4096;
+				frame->height =2048;
+				frame->linesize[0]=4096;
+				frame->linesize[1]=2048;
+				frame->linesize[2]=2048;
+				  
+				  
+				bytes_num = avpicture_get_size(AV_PIX_FMT_YUYV422 , 4096, 512); 
+				  
+				memcpy(pFrame->data[0], src_data[0], bytes_num);
+				  
+				**/
+				
+				
+				
+				/**
+				int bytes_num = avpicture_get_size(AV_PIX_FMT_YUYV422 , 4096, 512);
+				ALOGD("[AVFrame Debug] byte num of YUYV422 4096*512 = %d", bytes_num);
+				uint8_t * buff = (uint8_t * ) av_malloc(bytes_num);
+				memcpy(buff, pFrame->data[0], bytes_num);
+				ALOGD("[AVFrame Debug] data 2 - data 1 = %d", (pFrame->data[2]-pFrame->data[1]));
+				ALOGD("[AVFrame Debug] data 1 - data 0 = %d", (pFrame->data[1]-pFrame->data[0]));
+				  
+				int bytes_num_2 = avpicture_get_size(AV_PIX_FMT_YUYV422 , 4096, 2048);
+				ALOGD("[AVFrame Debug] byte num of YUYV422 4096*2048 = %d", bytes_num_2);
+				uint8_t * buff_2 = (uint8_t * ) av_malloc(bytes_num_2);
+				  
+				memcpy(buff_2, buff, bytes_num);
+				//memcpy(buff_2+bytes_num, buff, bytes_num);
+				//memcpy(buff_2+2*bytes_num, buff, bytes_num);
+				//memcpy(buff_2+3*bytes_num, buff, bytes_num);
+				  
+				avpicture_fill((AVPicture * ) pFrame, buff_2, AV_PIX_FMT_YUYV422, 4096, 2048);
+				**/
+				
+				
+				/**
+
+				  
+				  
+				  
+				int av_image_copy_to_buffer	(	uint8_t * 	dst,
+				  int 	dst_size,
+				  const uint8_t *const 	src_data[4],
+				  const int 	src_linesize[4],
+				  enum AVPixelFormat 	pix_fmt,
+				  int 	width,
+				  int 	height,
+				  int 	align 
+					)	
+				**/
+				
+				
+				//ALOGD("[AVFrame Debug 4] Frame size (4096*2048) = %d", avpicture_get_size(AV_PIX_FMT_YUYV422 , 4096, 2048));
+				//ALOGD("[AVFrame Debug 4] Frame size (4096*512) = %d", avpicture_get_size(AV_PIX_FMT_YUYV422 , 4096, 512));
+				
+				//ALOGD("[AVFrame Debug 4] data 3 - data 2 = %d", (pFrame_part_4->data[3]-pFrame_part_4->data[2]));
+				//ALOGD("[AVFrame Debug 4] data 2 - data 1 = %d", (pFrame_part_4->data[2]-pFrame_part_4->data[1]));
+				//ALOGD("[AVFrame Debug 4] data 1 - data 0 = %d", (pFrame_part_4->data[1]-pFrame_part_4->data[0]));
+				
+				//ALOGD("[AVFrame Debug 4] frame->linesize[0] = %d", pFrame_part_4->linesize[0]);
+				//ALOGD("[AVFrame Debug 4] frame->linesize[1] = %d", pFrame_part_4->linesize[1]);
+				//ALOGD("[AVFrame Debug 4] frame->linesize[2] = %d", pFrame_part_4->linesize[2]);
+				//ALOGD("[AVFrame Debug 4] frame->linesize[3] = %d", pFrame_part_4->linesize[3]);
+				
+
+				
+				//copy redundant data
+				if(false)
+				{
+					
+					uint8_t * buff_point;
+					buff_point=buff;
+					
+					//copy Y data
+					memcpy(buff_point, pFrame->data[0], pFrame->linesize[0]*512);
+					buff_point+=pFrame->linesize[0]*512;
+					memcpy(buff_point, pFrame->data[0], pFrame->linesize[0]*512);
+					buff_point+=pFrame->linesize[0]*512;
+					memcpy(buff_point, pFrame->data[0], pFrame->linesize[0]*512);
+					buff_point+=pFrame->linesize[0]*512;
+					memcpy(buff_point, pFrame->data[0], pFrame->linesize[0]*512);
+					buff_point+=pFrame->linesize[0]*512;
+					
+					//copy U data
+					memcpy(buff_point, pFrame->data[1], pFrame->linesize[1]*512/2);
+					buff_point+=pFrame->linesize[1]*512/2;
+					memcpy(buff_point, pFrame->data[1], pFrame->linesize[1]*512/2);
+					buff_point+=pFrame->linesize[1]*512/2;
+					memcpy(buff_point, pFrame->data[1], pFrame->linesize[1]*512/2);
+					buff_point+=pFrame->linesize[1]*512/2;
+					memcpy(buff_point, pFrame->data[1], pFrame->linesize[1]*512/2);
+					buff_point+=pFrame->linesize[1]*512/2;
+					
+					//copy V data
+					memcpy(buff_point, pFrame->data[2], pFrame->linesize[2]*512/2);
+					buff_point+=pFrame->linesize[2]*512/2;	
+					memcpy(buff_point, pFrame->data[2], pFrame->linesize[2]*512/2);
+					buff_point+=pFrame->linesize[2]*512/2;
+					memcpy(buff_point, pFrame->data[2], pFrame->linesize[2]*512/2);
+					buff_point+=pFrame->linesize[2]*512/2;	
+					memcpy(buff_point, pFrame->data[2], pFrame->linesize[2]*512/2);
+					buff_point+=pFrame->linesize[2]*512/2;
+					
+					//ALOGD("[AVFrame Debug 4] buff_point - buff = %d", (buff_point-buff));
+					/**
+					**Try to merge two AVFrames in a buffer
+					**/
+					
+					
+					
+					
+					
+					
+					//av_image_copy_to_buffer(buff, bytes_num, pFrame->data, pFrame->linesize, pFrame->format, 4096, 512, 32);
+					
+					
+					/**
+					av_image_fill_arrays	(	uint8_t * 	dst_data[4],
+						int 	dst_linesize[4],
+						const uint8_t * 	src,
+						enum AVPixelFormat 	pix_fmt,
+						int 	width,
+						int 	height,
+						int 	align 
+					   )	
+					**/
+					
+					av_image_fill_arrays(pFrame->data, pFrame->linesize, buff, pFrame->format, 4096, 2048, 32);
+					pFrame->width = 4096;
+					pFrame->height = 2048;
+				}
+				
+				
+				//VRdisplay(ffp, pFrame, bmp);
+				//change to pipeline
+				SDL_LockMutex(subframe_num_lock);
+				//ALOGD("Dead lock Debug Part 2 Point 1");
+				subframe_num++;
+				//ALOGD("[Dead lock Debug] Thread 4, decoded a new frame subframe_num = %d",subframe_num);
+				//ALOGD("Dead lock Debug Part 2 Point 2");
+				//if(subframe_num==4)
+				{
+					//merge_frames();
+					//SDL_CondSignal(display_thread_cond);
+					//subframe_num=0;
+					//merge_frames();		
+					//ALOGD("Dead lock Debug Part 4 SDL_CondSignal(display_thread_cond)");
+					
+					//SDL_UnlockMutex(subframe_num_lock);
+
+					//SDL_CondBroadcast(read_thread_cond);
+					
+					//continue;
+					//SDL_UnlockMutex(subframe_num_lock);
+					//push_Frame();
+					//SDL_CondSignal(read_thread_cond);
+					//continue;
+				}
+				//ALOGD("Dead lock Debug Part 2 Point 3");
+				SDL_UnlockMutex(subframe_num_lock);
+				//ALOGD("Dead lock Debug Part 2 Point 4");
+				
+
+				SDL_LockMutex(read_thread_lock);
+				//ALOGD("Dead lock Debug Part 4 SDL_CondSignal(display_thread_cond)");
+				SDL_CondSignal(display_thread_cond);
+				//ALOGD("Dead lock Debug Part 4 is blocking Before SDL_CondWait");
+				SDL_CondWait(read_thread_cond, read_thread_lock);
+				//ALOGD("Dead lock Debug Part 4 is resuming After SDL_CondWait");
+				SDL_UnlockMutex(read_thread_lock);
+				//ALOGD("Dead lock Debug Part 2 Point 7");
+				
+				
+				
+				
+				
+				
+				
+				
+				//av_frame_free(&buff);
+                
+				
+				//VRdisplay(ffp, av_frame_clone(pFrame), bmp);
+                // To employ pipline, we do not display here, we just put the frame into a buffer
+                /*
+                if (i < 16) {
+                    is->nearby_buffer[i] = pFrame;
+                    //i++;
+                }
+                else {
+                    ALOGD("Video: the buffer is full\n");
+                    is->move_req = 1;
+                    //SDL_LockMutex(ffp->is->play_mutex);
+                }*/ 
+            }
+            //is->move_req = 0; // Here we finish a move behavior
+        }
+        //gettimeofday(&end, NULL);
+        decode_timeuse = 1000000 * ( decode_end.tv_sec - decode_start.tv_sec ) + decode_end.tv_usec - decode_start.tv_usec;
+        //ALOGD("[Decoding Debug] Thread 4 The decoding time for frame %d is %d us\n", frameIndex, decode_timeuse);
+        /*
+        if (frameIndex < 240)
+            frameIndex += 16;
+        else
+            frameIndex = 0;
+        */
+		
+		//ALOGV("Orientation, id = %d", orien);
+		
+		
+		
+		
+
+		
+		
+        av_packet_unref(&packet);
+        //ALOGD("Video: loop number is %d \n", i);
+        i++;
+        //}
+    }
+	
+    //ALOGD("Video: Outside the loop \n");
+    // Free the YUV frame
+    av_frame_free(&pFrame);
+    av_frame_free(&buff);
+	
+    // Close the codecs
+    avcodec_close(pCodecCtx);
+    avcodec_close(pCodecCtxOrig);
+
+    // Close the video file
+    avformat_close_input(&ic);
+    
+    return 0;
+}
+
+
+
+// Use SDL to display decoded frame
+void VRdisplay(void *arg, AVFrame *pFrame, SDL_VoutOverlay *bmp) {
+    FFPlayer *ffp = arg;
+    VideoState *is = ffp->is;
+    struct timeval tv, display_start, display_end;
+    //SDL_VoutOverlay *bmp;
+
+    //SDL_VoutSetOverlayFormat(ffp->vout, ffp->overlay_format);
+    //bmp = SDL_Vout_CreateOverlay(pFrame->width, pFrame->height,
+                    //pFrame->format,
+                    //ffp->vout);
+
+    SDL_VoutLockYUVOverlay(bmp);
+    
+	
+	gettimeofday(&display_start, NULL);
+    if (SDL_VoutFillFrameYUVOverlay(bmp, pFrame) < 0) {
+        av_log(NULL, AV_LOG_FATAL, "Cannot initialize the conversion context\n");
+        exit(1);
+    }
+	gettimeofday(&display_end, NULL);
+	//ALOGD("[SDL_VoutFillFrameYUVOverlay Frame: %d us]",(1000000 * ( display_end.tv_sec - display_start.tv_sec ) + display_end.tv_usec - display_start.tv_usec));
+	
+	
+
+    SDL_VoutUnlockYUVOverlay(bmp);
+
+    av_frame_unref(pFrame);
+
+	
+	
+	gettimeofday(&display_start, NULL);
+    SDL_VoutDisplayYUVOverlay(ffp->vout, bmp);
+    gettimeofday(&display_end, NULL);
+	//ALOGD("[SDL_VoutDisplayYUVOverlay Frame: %d us]",(1000000 * ( display_end.tv_sec - display_start.tv_sec ) + display_end.tv_usec - display_start.tv_usec));
+	
+	
+    gettimeofday(&tv, NULL);
+    //ALOGD("Video: Current frame time is %ld s , %d us \n", tv.tv_sec, tv.tv_usec);
+
+    SDL_VoutUnrefYUVOverlay(bmp);
+}
+
+/* this thread gets the stream from the disk or the network */
+static int original_read_thread(void *arg)
 {
     FFPlayer *ffp = arg;
     VideoState *is = ffp->is;
@@ -3021,12 +5355,6 @@ static int read_thread(void *arg)
         av_log(ffp, AV_LOG_WARNING, "remove 'timeout' option for rtmp.\n");
         av_dict_set(&ffp->format_opts, "timeout", NULL, 0);
     }
-
-    if (ffp->skip_calc_frame_rate) {
-        av_dict_set_int(&ic->metadata, "skip-calc-frame-rate", ffp->skip_calc_frame_rate, 0);
-        av_dict_set_int(&ffp->format_opts, "skip-calc-frame-rate", ffp->skip_calc_frame_rate, 0);
-    }
-
     if (ffp->iformat_name)
         is->iformat = av_find_input_format(ffp->iformat_name);
     err = avformat_open_input(&ic, is->filename, is->iformat, &ffp->format_opts);
@@ -3035,8 +5363,6 @@ static int read_thread(void *arg)
         ret = -1;
         goto fail;
     }
-    ffp_notify_msg1(ffp, FFP_MSG_OPEN_INPUT);
-
     if (scan_all_pmts_set)
         av_dict_set(&ffp->format_opts, "scan_all_pmts", NULL, AV_DICT_MATCH_CASE);
 
@@ -3056,21 +5382,8 @@ static int read_thread(void *arg)
 
     opts = setup_find_stream_info_opts(ic, ffp->codec_opts);
     orig_nb_streams = ic->nb_streams;
-    do {
-        if (av_stristart(is->filename, "data:", NULL) && orig_nb_streams > 0) {
-            for (i = 0; i < orig_nb_streams; i++) {
-                if (!ic->streams[i] || !ic->streams[i]->codecpar || ic->streams[i]->codecpar->profile == FF_PROFILE_UNKNOWN) {
-                    break;
-                }
-            }
 
-            if (i == orig_nb_streams) {
-                break;
-            }
-        }
-        err = avformat_find_stream_info(ic, opts);
-    } while(0);
-    ffp_notify_msg1(ffp, FFP_MSG_FIND_STREAM_INFO);
+    err = avformat_find_stream_info(ic, opts);
 
     for (i = 0; i < orig_nb_streams; i++)
         av_dict_free(&opts[i]);
@@ -3098,7 +5411,7 @@ static int read_thread(void *arg)
         window_title = av_asprintf("%s - %s", t->value, input_filename);
 
 #endif
-    /* if seeking requested, we execute it */
+    /* if seeking requested, we execute it (what the seeking here indicate?) */
     if (ffp->start_time != AV_NOPTS_VALUE) {
         int64_t timestamp;
 
@@ -3106,7 +5419,8 @@ static int read_thread(void *arg)
         /* add the stream start time */
         if (ic->start_time != AV_NOPTS_VALUE)
             timestamp += ic->start_time;
-        ret = avformat_seek_file(ic, -1, INT64_MIN, timestamp, INT64_MAX, 0);
+        //ret = avformat_seek_file(ic, -1, INT64_MIN, timestamp, INT64_MAX, 0);
+        ret = avformat_seek_file(ic, -1, INT64_MIN, timestamp, INT64_MAX, AVSEEK_FLAG_ANY);
         if (ret < 0) {
             av_log(NULL, AV_LOG_WARNING, "%s: could not seek to position %0.3f\n",
                     is->filename, (double)timestamp / AV_TIME_BASE);
@@ -3115,7 +5429,8 @@ static int read_thread(void *arg)
 
     is->realtime = is_realtime(ic);
 
-    av_dump_format(ic, 0, is->filename, 0);
+    if (true || ffp->show_status)
+        av_dump_format(ic, 0, is->filename, 0);
 
     int video_stream_count = 0;
     int h264_stream_count = 0;
@@ -3164,6 +5479,7 @@ static int read_thread(void *arg)
                                 NULL, 0);
 
     is->show_mode = ffp->show_mode;
+
 #ifdef FFP_MERGE // bbc: dunno if we need this
     if (st_index[AVMEDIA_TYPE_VIDEO] >= 0) {
         AVStream *st = ic->streams[st_index[AVMEDIA_TYPE_VIDEO]];
@@ -3189,7 +5505,6 @@ static int read_thread(void *arg)
     if (st_index[AVMEDIA_TYPE_SUBTITLE] >= 0) {
         stream_component_open(ffp, st_index[AVMEDIA_TYPE_SUBTITLE]);
     }
-    ffp_notify_msg1(ffp, FFP_MSG_COMPONENT_OPEN);
 
     ijkmeta_set_avformat_context_l(ffp->meta, ic);
     ffp->stat.bit_rate = ic->bit_rate;
@@ -3230,7 +5545,7 @@ static int read_thread(void *arg)
     ffp_notify_msg1(ffp, FFP_MSG_PREPARED);
     if (!ffp->start_on_prepared) {
         while (is->pause_req && !is->abort_request) {
-            SDL_Delay(20);
+            SDL_Delay(100);
         }
     }
     if (ffp->auto_resume) {
@@ -3239,7 +5554,7 @@ static int read_thread(void *arg)
     }
     /* offset should be seeked*/
     if (ffp->seek_at_start > 0) {
-        ffp_seek_to_l(ffp, (long)(ffp->seek_at_start));
+        ffp_seek_to_l(ffp, ffp->seek_at_start);
     }
 
     for (;;) {
@@ -3265,6 +5580,7 @@ static int read_thread(void *arg)
         }
 #endif
         if (is->seek_req) {
+            ALOGD("Video: seek now!!!\n");
             int64_t seek_target = is->seek_pos;
             int64_t seek_min    = is->seek_rel > 0 ? seek_target - is->seek_rel + 2: INT64_MIN;
             int64_t seek_max    = is->seek_rel < 0 ? seek_target - is->seek_rel - 2: INT64_MAX;
@@ -3273,7 +5589,7 @@ static int read_thread(void *arg)
 
             ffp_toggle_buffering(ffp, 1);
             ffp_notify_msg3(ffp, FFP_MSG_BUFFERING_UPDATE, 0, 0);
-            ret = avformat_seek_file(is->ic, -1, seek_min, seek_target, seek_max, is->seek_flags);
+            ret = avformat_seek_file(is->ic, -1, seek_min, seek_target, seek_max, AVSEEK_FLAG_ANY);
             if (ret < 0) {
                 av_log(NULL, AV_LOG_ERROR,
                        "%s: error while seeking\n", is->ic->filename);
@@ -3303,7 +5619,7 @@ static int read_thread(void *arg)
                 is->latest_seek_load_start_at = av_gettime();
             }
             ffp->dcc.current_high_water_mark_in_ms = ffp->dcc.first_high_water_mark_in_ms;
-            is->seek_req = 0;
+            is->seek_req = 0;  //finish the seek operation???
             is->queue_attachments_req = 1;
             is->eof = 0;
 #ifdef FFP_MERGE
@@ -3322,22 +5638,6 @@ static int read_thread(void *arg)
             if (is->pause_req)
                 step_to_next_frame_l(ffp);
             SDL_UnlockMutex(ffp->is->play_mutex);
-
-            if (ffp->enable_accurate_seek) {
-                is->drop_aframe_count = 0;
-                is->drop_vframe_count = 0;
-                SDL_LockMutex(is->accurate_seek_mutex);
-                if (is->video_stream >= 0) {
-                    is->video_accurate_seek_req = 1;
-                }
-                if (is->audio_stream >= 0) {
-                    is->audio_accurate_seek_req = 1;
-                }
-                SDL_CondSignal(is->audio_accurate_seek_cond);
-                SDL_CondSignal(is->video_accurate_seek_cond);
-                SDL_UnlockMutex(is->accurate_seek_mutex);
-            }
-
             ffp_notify_msg3(ffp, FFP_MSG_SEEK_COMPLETE, (int)fftime_to_milliseconds(seek_target), ret);
             ffp_toggle_buffering(ffp, 1);
         }
@@ -3413,7 +5713,6 @@ static int read_thread(void *arg)
             int pb_eof = 0;
             int pb_error = 0;
             if ((ret == AVERROR_EOF || avio_feof(ic->pb)) && !is->eof) {
-                ffp_check_buffering_l(ffp);
                 pb_eof = 1;
                 // check error later
             }
@@ -3444,7 +5743,12 @@ static int read_thread(void *arg)
                     packet_queue_put_nullpacket(&is->subtitleq, is->subtitle_stream);
                 is->eof = 1;
                 ffp->error = pb_error;
-                av_log(ffp, AV_LOG_ERROR, "av_read_frame error: %s\n", ffp_get_error_string(ffp->error));
+                av_log(ffp, AV_LOG_ERROR, "av_read_frame error: %x(%c,%c,%c,%c): %s\n", ffp->error,
+                      (char) (0xff & (ffp->error >> 24)),
+                      (char) (0xff & (ffp->error >> 16)),
+                      (char) (0xff & (ffp->error >> 8)),
+                      (char) (0xff & (ffp->error)),
+                      ffp_get_error_string(ffp->error));
                 // break;
             } else {
                 ffp->error = 0;
@@ -3497,17 +5801,9 @@ static int read_thread(void *arg)
 
         if (ffp->packet_buffering) {
             io_tick_counter = SDL_GetTickHR();
-            if ((!ffp->first_video_frame_rendered && is->video_st) || (!ffp->first_audio_frame_rendered && is->audio_st)) {
-                if (abs((int)(io_tick_counter - prev_io_tick_counter)) > FAST_BUFFERING_CHECK_PER_MILLISECONDS) {
-                    prev_io_tick_counter = io_tick_counter;
-                    ffp->dcc.current_high_water_mark_in_ms = ffp->dcc.first_high_water_mark_in_ms;
-                    ffp_check_buffering_l(ffp);
-                }
-            } else {
-                if (abs((int)(io_tick_counter - prev_io_tick_counter)) > BUFFERING_CHECK_PER_MILLISECONDS) {
-                    prev_io_tick_counter = io_tick_counter;
-                    ffp_check_buffering_l(ffp);
-                }
+            if (abs((int)(io_tick_counter - prev_io_tick_counter)) > BUFFERING_CHECK_PER_MILLISECONDS) {
+                prev_io_tick_counter = io_tick_counter;
+                ffp_check_buffering_l(ffp);
             }
         }
     }
@@ -3538,13 +5834,9 @@ static VideoState *stream_open(FFPlayer *ffp, const char *filename, AVInputForma
     if (!is->filename)
         goto fail;
     is->iformat = iformat;
+
     is->ytop    = 0;
     is->xleft   = 0;
-#if defined(__ANDROID__)
-    if (ffp->soundtouch_enable) {
-        is->handle = ijk_soundtouch_create();
-    }
-#endif
 
     /* start video display */
     if (frame_queue_init(&is->pictq, &is->videoq, ffp->pictq_size, 1) < 0)
@@ -3564,32 +5856,15 @@ static VideoState *stream_open(FFPlayer *ffp, const char *filename, AVInputForma
         goto fail;
     }
 
-    if (!(is->video_accurate_seek_cond = SDL_CreateCond())) {
-        av_log(NULL, AV_LOG_FATAL, "SDL_CreateCond(): %s\n", SDL_GetError());
-        ffp->enable_accurate_seek = 0;
-    }
-
-    if (!(is->audio_accurate_seek_cond = SDL_CreateCond())) {
-        av_log(NULL, AV_LOG_FATAL, "SDL_CreateCond(): %s\n", SDL_GetError());
-        ffp->enable_accurate_seek = 0;
-    }
-
     init_clock(&is->vidclk, &is->videoq.serial);
     init_clock(&is->audclk, &is->audioq.serial);
     init_clock(&is->extclk, &is->extclk.serial);
     is->audio_clock_serial = -1;
-    if (ffp->startup_volume < 0)
-        av_log(NULL, AV_LOG_WARNING, "-volume=%d < 0, setting to 0\n", ffp->startup_volume);
-    if (ffp->startup_volume > 100)
-        av_log(NULL, AV_LOG_WARNING, "-volume=%d > 100, setting to 100\n", ffp->startup_volume);
-    ffp->startup_volume = av_clip(ffp->startup_volume, 0, 100);
-    ffp->startup_volume = av_clip(SDL_MIX_MAXVOLUME * ffp->startup_volume / 100, 0, SDL_MIX_MAXVOLUME);
-    is->audio_volume = ffp->startup_volume;
+    is->audio_volume = SDL_MIX_MAXVOLUME;
     is->muted = 0;
     is->av_sync_type = ffp->av_sync_type;
 
     is->play_mutex = SDL_CreateMutex();
-    is->accurate_seek_mutex = SDL_CreateMutex();
     ffp->is = is;
     is->pause_req = !ffp->start_on_prepared;
 
@@ -3609,6 +5884,112 @@ fail:
         stream_close(ffp);
         return NULL;
     }
+    return is;
+}
+
+static VideoState *vr_stream_open(FFPlayer *ffp, const char *filename, AVInputFormat *iformat)
+{
+    assert(!ffp->is);
+    VideoState *is;
+    SDL_mutex *mutex;
+    SDL_cond *cond;
+
+    is = av_mallocz(sizeof(VideoState));
+    if (!is)
+        return NULL;
+    is->filename = av_strdup(filename);
+    if (!is->filename)
+        goto fail;
+    is->iformat = iformat;
+    
+    is->ytop    = 1024;
+    is->xleft   = 0;
+    ALOGD("We change the ytop and xleft variables' values \n");
+
+    if (!(mutex = SDL_CreateMutex())) {
+        av_log(NULL, AV_LOG_FATAL, "SDL_CreateMutex(): %s\n", SDL_GetError());
+        return AVERROR(ENOMEM);
+    }
+    if (!(cond = SDL_CreateCond())) {
+        av_log(NULL, AV_LOG_FATAL, "SDL_CreateCond(): %s\n", SDL_GetError());
+        return AVERROR(ENOMEM);
+    }
+
+    if (!(is->continue_read_thread = SDL_CreateCond())) {
+        av_log(NULL, AV_LOG_FATAL, "SDL_CreateCond(): %s\n", SDL_GetError());
+        goto fail;
+    }
+
+    init_clock(&is->vidclk, &is->videoq.serial);
+    init_clock(&is->audclk, &is->audioq.serial);
+    init_clock(&is->extclk, &is->extclk.serial);
+    is->audio_clock_serial = -1;
+    is->audio_volume = SDL_MIX_MAXVOLUME;
+    is->muted = 0;
+    is->av_sync_type = ffp->av_sync_type;
+
+    is->play_mutex = SDL_CreateMutex();
+    ffp->is = is;
+    is->pause_req = !ffp->start_on_prepared;
+    //is->move_req = 0;
+
+    //ALOGD("Video: Just before creating the video_refresh_thread\n");
+    //is->video_refresh_tid = SDL_CreateThreadEx(&is->_video_refresh_tid, video_refresh_thread, ffp, "ff_vout");
+    //if (!is->video_refresh_tid) {
+        //av_freep(&ffp->is);
+        //return NULL;
+    //}
+
+	
+	
+	//inititialize mutex and cond
+	read_thread_lock = SDL_CreateMutex();
+	display_thread_lock = SDL_CreateMutex();
+	subframe_num_lock = SDL_CreateMutex();
+	
+	read_thread_cond = SDL_CreateCond();
+	display_thread_cond = SDL_CreateCond();
+	
+	
+	Frame_lock = SDL_CreateMutex();
+	Frame_cond_push = SDL_CreateCond();
+	Frame_cond_pull = SDL_CreateCond();
+	
+	//initialize SDL overlay
+	SDL_VoutSetOverlayFormat(ffp->vout, ffp->overlay_format);
+    bmp = SDL_Vout_CreateOverlay(
+			  4096,//pFrame->width,
+			  2048,//(pFrame->height)*4,
+			  12,//pFrame->format,
+			  ffp->vout);
+	
+	//initialize frame buffer
+	int bytes_num = avpicture_get_size(12/**pFrame->format**/ , 4096, 2048);
+	//buff = (uint8_t * ) av_malloc(bytes_num);
+	
+    ALOGD("Video: Just before creating the read_thread\n");
+    is->read1_tid = SDL_CreateThreadEx(&is->_read1_tid, read_thread_part_1, ffp, "ff_read1");
+	is->read2_tid = SDL_CreateThreadEx(&is->_read2_tid, read_thread_part_2, ffp, "ff_read2");
+	is->read3_tid = SDL_CreateThreadEx(&is->_read3_tid, read_thread_part_3, ffp, "ff_read3");
+	is->read4_tid = SDL_CreateThreadEx(&is->_read4_tid, read_thread_part_4, ffp, "ff_read4");
+	
+	
+	//start a display thread for displaying decoded frames
+	is->display_tid = SDL_CreateThreadEx(&is->_display_tid, display_thread, ffp, "display_thread");
+	//display_thread((void*)ffp);
+	
+	
+
+    if (!is->read1_tid || !is->read2_tid) {
+        av_log(NULL, AV_LOG_FATAL, "SDL_CreateThread(): %s\n", SDL_GetError());
+fail:
+        is->abort_request = true;
+        if (is->video_refresh_tid)
+            SDL_WaitThread(is->video_refresh_tid, NULL);
+        stream_close(ffp);
+        return NULL;
+    }
+
     return is;
 }
 
@@ -3636,13 +6017,28 @@ static int video_refresh_thread(void *arg)
 {
     FFPlayer *ffp = arg;
     VideoState *is = ffp->is;
+    int i = 0;
+
+    while (!is->abort_request) {
+        //ALOGD("Video: inside the loop \n");
+    }
+
+    return 0;
+}
+
+static int original_video_refresh_thread(void *arg)
+{
+    FFPlayer *ffp = arg;
+    VideoState *is = ffp->is;
     double remaining_time = 0.0;
     while (!is->abort_request) {
         if (remaining_time > 0.0)
             av_usleep((int)(int64_t)(remaining_time * 1000000.0));
         remaining_time = REFRESH_RATE;
-        if (is->show_mode != SHOW_MODE_NONE && (!is->paused || is->force_refresh))
+        if (is->show_mode != SHOW_MODE_NONE && (!is->paused || is->force_refresh)) {
+            //ALOGD("Video: video_refresh() will be called\n");
             video_refresh(ffp, &remaining_time);
+        }
     }
 
     return 0;
@@ -3935,10 +6331,8 @@ static int app_func_event(AVApplicationContext *h, int message ,void *data, size
         return 0;
     if (message == AVAPP_EVENT_IO_TRAFFIC && sizeof(AVAppIOTraffic) == size) {
         AVAppIOTraffic *event = (AVAppIOTraffic *)(intptr_t)data;
-        if (event->bytes > 0) {
-            ffp->stat.byte_count += event->bytes;
+        if (event->bytes > 0)
             SDL_SpeedSampler2Add(&ffp->stat.tcp_read_sampler, event->bytes);
-        }
     } else if (message == AVAPP_EVENT_ASYNC_STATISTIC && sizeof(AVAppAsyncStatistic) == size) {
         AVAppAsyncStatistic *statistic =  (AVAppAsyncStatistic *) (intptr_t)data;
         ffp->stat.buf_backwards = statistic->buf_backwards;
@@ -3947,6 +6341,17 @@ static int app_func_event(AVApplicationContext *h, int message ,void *data, size
     }
     return inject_callback(ffp->inject_opaque, message , data, size);
 }
+
+
+void ffp_set_ijkio_inject_node(FFPlayer *ffp, int index, int64_t file_logical_pos, int64_t physical_pos, int64_t cache_size, int64_t file_size)
+{
+    if (!ffp || !ffp->ijkio_manager_ctx)
+        return;
+
+    ijkio_manager_inject_node(ffp->ijkio_manager_ctx, index, file_logical_pos, physical_pos, cache_size, file_size);
+}
+
+
 
 static int ijkio_app_func_event(IjkIOApplicationContext *h, int message ,void *data, size_t size)
 {
@@ -3969,36 +6374,6 @@ static int ijkio_app_func_event(IjkIOApplicationContext *h, int message ,void *d
     return 0;
 }
 
-void ffp_set_frame_at_time(FFPlayer *ffp, const char *path, int64_t start_time, int64_t end_time, int num, int definition) {
-    if (!ffp->get_img_info) {
-        ffp->get_img_info = av_mallocz(sizeof(GetImgInfo));
-        if (!ffp->get_img_info) {
-            ffp_notify_msg3(ffp, FFP_MSG_GET_IMG_STATE, 0, -1);
-            return;
-        }
-    }
-
-    if (start_time >= 0 && num > 0 && end_time >= 0 && end_time >= start_time) {
-        ffp->get_img_info->img_path   = av_strdup(path);
-        ffp->get_img_info->start_time = start_time;
-        ffp->get_img_info->end_time   = end_time;
-        ffp->get_img_info->num        = num;
-        ffp->get_img_info->count      = num;
-        if (definition== HD_IMAGE) {
-            ffp->get_img_info->width  = 640;
-            ffp->get_img_info->height = 360;
-        } else if (definition == SD_IMAGE) {
-            ffp->get_img_info->width  = 320;
-            ffp->get_img_info->height = 180;
-        } else {
-            ffp->get_img_info->width  = 160;
-            ffp->get_img_info->height = 90;
-        }
-    } else {
-        ffp->get_img_info->count = 0;
-        ffp_notify_msg3(ffp, FFP_MSG_GET_IMG_STATE, 0, -1);
-    }
-}
 
 void *ffp_set_ijkio_inject_opaque(FFPlayer *ffp, void *opaque)
 {
@@ -4014,6 +6389,8 @@ void *ffp_set_ijkio_inject_opaque(FFPlayer *ffp, void *opaque)
 
     return prev_weak_thiz;
 }
+
+
 
 void *ffp_set_inject_opaque(FFPlayer *ffp, void *opaque)
 {
@@ -4174,7 +6551,8 @@ int ffp_prepare_async_l(FFPlayer *ffp, const char *file_name)
     }
 #endif
 
-    VideoState *is = stream_open(ffp, file_name, NULL);
+    //VideoState *is = stream_open(ffp, file_name, NULL);
+    VideoState *is = vr_stream_open(ffp, file_name, NULL);
     if (!is) {
         av_log(NULL, AV_LOG_WARNING, "ffp_prepare_async_l: stream_open failed OOM");
         return EIJK_OUT_OF_MEMORY;
@@ -4182,6 +6560,196 @@ int ffp_prepare_async_l(FFPlayer *ffp, const char *file_name)
 
     ffp->is = is;
     ffp->input_filename = av_strdup(file_name);
+	
+	
+	//try to start display thread in the main thread
+	if(false)
+	{
+		
+		struct timeval last_time, current_time;
+
+		struct timeval merge_start, merge_end;
+		
+		struct timeval display_start, display_end;
+		
+		ALOGD("[Parallel Debug] start display_thread.");
+		
+		gettimeofday(&last_time, NULL);
+		
+
+		
+		while(true)
+		{
+			SDL_LockMutex(subframe_num_lock);
+			while(subframe_num!=4)
+			{
+				//ALOGD("Dead lock Debug, Loop, Before SDL Wait");
+				//SDL_CondWaitTimeout(display_thread_cond, subframe_num_lock, 50);
+				SDL_CondWait(display_thread_cond, subframe_num_lock);
+				//ALOGD("Dead lock Debug, Loop, After SDL Wait");
+			}
+			subframe_num=0;
+			SDL_UnlockMutex(subframe_num_lock);
+			
+			//ALOGD("Dead lock Debug, Loop, Before VRdisplay");
+			
+			if(buff==NULL)
+			{
+				int bytes_num = avpicture_get_size(pFrame_part_1->format, 4096, 2048);
+				buff = (uint8_t * ) av_malloc(bytes_num);	
+				ALOGD("Allocate bytes for frame buffer");
+			}
+			
+			if(pFrame==NULL)
+			{
+				pFrame = av_frame_alloc();
+			}
+			
+			//copy redundant data
+			if(true)
+			{
+				uint8_t * buff_point;
+				buff_point=buff;
+				
+				gettimeofday(&merge_start, NULL);
+				
+				
+				//copy Y data
+				memcpy(buff_point, pFrame_part_1->data[0], pFrame_part_1->linesize[0]*512);
+				buff_point+=pFrame_part_1->linesize[0]*512;
+				memcpy(buff_point, pFrame_part_2->data[0], pFrame_part_2->linesize[0]*512);
+				buff_point+=pFrame_part_2->linesize[0]*512;
+				memcpy(buff_point, pFrame_part_3->data[0], pFrame_part_3->linesize[0]*512);
+				buff_point+=pFrame_part_3->linesize[0]*512;
+				memcpy(buff_point, pFrame_part_4->data[0], pFrame_part_4->linesize[0]*512);
+				buff_point+=pFrame_part_4->linesize[0]*512;
+				
+				//copy U data
+				ALOGD("[AVFrame Debug] start to merge U data");
+				memcpy(buff_point, pFrame_part_1->data[1], pFrame_part_1->linesize[1]*512/2);
+				buff_point+=pFrame_part_1->linesize[1]*512/2;
+				memcpy(buff_point, pFrame_part_2->data[1], pFrame_part_2->linesize[1]*512/2);
+				buff_point+=pFrame_part_2->linesize[1]*512/2;
+				memcpy(buff_point, pFrame_part_3->data[1], pFrame_part_3->linesize[1]*512/2);
+				buff_point+=pFrame_part_3->linesize[1]*512/2;
+				memcpy(buff_point, pFrame_part_4->data[1], pFrame_part_4->linesize[1]*512/2);
+				buff_point+=pFrame_part_4->linesize[1]*512/2;
+				
+				//copy V data
+				ALOGD("[AVFrame Debug] start to merge V data");
+				memcpy(buff_point, pFrame_part_1->data[2], pFrame_part_1->linesize[2]*512/2);
+				buff_point+=pFrame_part_1->linesize[2]*512/2;	
+				memcpy(buff_point, pFrame_part_2->data[2], pFrame_part_2->linesize[2]*512/2);
+				buff_point+=pFrame_part_2->linesize[2]*512/2;
+				memcpy(buff_point, pFrame_part_3->data[2], pFrame_part_3->linesize[2]*512/2);
+				buff_point+=pFrame_part_3->linesize[2]*512/2;	
+				memcpy(buff_point, pFrame_part_4->data[2], pFrame_part_4->linesize[2]*512/2);
+				buff_point+=pFrame_part_4->linesize[2]*512/2;
+				
+				ALOGD("[AVFrame Debug ] buff_point - buff = %d", (buff_point-buff));
+				/**
+				**Try to merge two AVFrames in a buffer
+				**/
+				
+				
+				
+				
+				
+				
+				//av_image_copy_to_buffer(buff, bytes_num, pFrame->data, pFrame->linesize, pFrame->format, 4096, 512, 32);
+				
+				
+				/**
+				av_image_fill_arrays	(	uint8_t * 	dst_data[4],
+				 int 	dst_linesize[4],
+				 const uint8_t * 	src,
+				 enum AVPixelFormat 	pix_fmt,
+				 int 	width,
+				 int 	height,
+				 int 	align 
+				   )	
+				**/
+				/**
+				av_image_fill_arrays(pFrame_part_1->data, pFrame_part_1->linesize, buff, pFrame_part_1->format, 4096, 2048, 32);
+				pFrame_part_1->width = 4096;
+				pFrame_part_1->height = 2048;
+				**/
+				
+
+				pFrame->width = 4096;
+				pFrame->height = 2048;
+				pFrame->format = pFrame_part_1->format;
+				av_image_fill_arrays(pFrame->data, pFrame->linesize, buff, pFrame->format, 4096, 2048, 32);
+				
+				gettimeofday(&merge_end, NULL);
+				ALOGD("[Merge Frame: %d us]",(1000000 * ( merge_end.tv_sec - merge_start.tv_sec ) + merge_end.tv_usec - merge_start.tv_usec));
+			}
+			
+
+			
+			//start to merge subframes
+			if(false)
+			{
+				uint8_t * buff_point;
+				buff_point=buff;
+				
+				//copy Y data
+				memcpy(buff_point, pFrame_part_1->data[0], pFrame_part_1->linesize[0]*512);
+				buff_point+=pFrame_part_1->linesize[0]*512;
+				memcpy(buff_point, pFrame_part_2->data[0], pFrame_part_2->linesize[0]*512);
+				buff_point+=pFrame_part_2->linesize[0]*512;
+				memcpy(buff_point, pFrame_part_1->data[0], pFrame_part_1->linesize[0]*512);
+				buff_point+=pFrame_part_1->linesize[0]*512;
+				memcpy(buff_point, pFrame_part_2->data[0], pFrame_part_2->linesize[0]*512);
+				buff_point+=pFrame_part_2->linesize[0]*512;
+				
+				//copy U data
+				memcpy(buff_point, pFrame_part_1->data[1], pFrame_part_1->linesize[1]*512/2);
+				buff_point+=pFrame_part_1->linesize[1]*512/2;
+				memcpy(buff_point, pFrame_part_2->data[1], pFrame_part_2->linesize[1]*512/2);
+				buff_point+=pFrame_part_2->linesize[1]*512/2;
+				memcpy(buff_point, pFrame_part_1->data[1], pFrame_part_1->linesize[1]*512/2);
+				buff_point+=pFrame_part_1->linesize[1]*512/2;
+				memcpy(buff_point, pFrame_part_2->data[1], pFrame_part_2->linesize[1]*512/2);
+				buff_point+=pFrame_part_2->linesize[1]*512/2;
+				
+				//copy V data
+				memcpy(buff_point, pFrame_part_1->data[2], pFrame_part_1->linesize[2]*512/2);
+				buff_point+=pFrame_part_1->linesize[2]*512/2;	
+				memcpy(buff_point, pFrame_part_2->data[2], pFrame_part_2->linesize[2]*512/2);
+				buff_point+=pFrame_part_2->linesize[2]*512/2;
+				memcpy(buff_point, pFrame_part_1->data[2], pFrame_part_1->linesize[2]*512/2);
+				buff_point+=pFrame_part_1->linesize[2]*512/2;	
+				memcpy(buff_point, pFrame_part_2->data[2], pFrame_part_2->linesize[2]*512/2);
+				buff_point+=pFrame_part_2->linesize[2]*512/2;
+				
+				//re-fill pFrame_part_1
+				av_image_fill_arrays(pFrame_part_1->data, pFrame_part_1->linesize, buff, pFrame_part_1->format, 4096, 2048, 32);
+				pFrame->width = 4096;
+				pFrame->height = 2048;
+				
+			}	
+			
+			gettimeofday(&current_time, NULL);
+			ALOGD("[Frame Interval: %d]",(1000000 * ( current_time.tv_sec - last_time.tv_sec ) + current_time.tv_usec - last_time.tv_usec));
+			last_time = current_time;
+			
+			
+			gettimeofday(&display_start, NULL);
+			VRdisplay(ffp, pFrame, bmp);
+			gettimeofday(&display_end, NULL);
+			
+			ALOGD("[Display Debug: %d us ]",(1000000 * ( display_end.tv_sec - display_start.tv_sec ) + display_end.tv_usec - display_start.tv_usec));
+			
+			SDL_CondBroadcast(read_thread_cond);
+
+			
+		}
+	}
+	
+	
+	
+	
     return 0;
 }
 
@@ -4240,15 +6808,6 @@ int ffp_stop_l(FFPlayer *ffp)
     }
 
     msg_queue_abort(&ffp->msg_queue);
-    if (ffp->enable_accurate_seek && is && is->accurate_seek_mutex
-        && is->audio_accurate_seek_cond && is->video_accurate_seek_cond) {
-        SDL_LockMutex(is->accurate_seek_mutex);
-        is->audio_accurate_seek_req = 0;
-        is->video_accurate_seek_req = 0;
-        SDL_CondSignal(is->audio_accurate_seek_cond);
-        SDL_CondSignal(is->video_accurate_seek_cond);
-        SDL_UnlockMutex(is->accurate_seek_mutex);
-    }
     return 0;
 }
 
@@ -4268,20 +6827,11 @@ int ffp_seek_to_l(FFPlayer *ffp, long msec)
 {
     assert(ffp);
     VideoState *is = ffp->is;
-    int64_t start_time = 0;
-    int64_t seek_pos = milliseconds_to_fftime(msec);
-    int64_t duration = milliseconds_to_fftime(ffp_get_duration_l(ffp));
-
     if (!is)
         return EIJK_NULL_IS_PTR;
 
-    if (duration > 0 && seek_pos >= duration && ffp->enable_accurate_seek) {
-        toggle_pause(ffp, 1);
-        ffp_notify_msg1(ffp, FFP_MSG_COMPLETED);
-        return 0;
-    }
-
-    start_time = is->ic->start_time;
+    int64_t seek_pos = milliseconds_to_fftime(msec);
+    int64_t start_time = is->ic->start_time;
     if (start_time > 0 && start_time != AV_NOPTS_VALUE)
         seek_pos += start_time;
 
@@ -4475,7 +7025,7 @@ void ffp_track_statistic_l(FFPlayer *ffp, AVStream *st, PacketQueue *q, FFTrackC
         cache->packets = q->nb_packets;
     }
 
-    if (q && st && st->time_base.den > 0 && st->time_base.num > 0) {
+    if (st && st->time_base.den > 0 && st->time_base.num > 0) {
         cache->duration = q->duration * av_q2d(st->time_base) * 1000;
     }
 }
@@ -4610,8 +7160,8 @@ void ffp_check_buffering_l(FFPlayer *ffp)
         ffp->dcc.current_high_water_mark_in_ms = hwm_in_ms;
 
         if (is->buffer_indicator_queue && is->buffer_indicator_queue->nb_packets > 0) {
-            if (   (is->audioq.nb_packets >= MIN_MIN_FRAMES || is->audio_stream < 0 || is->audioq.abort_request)
-                && (is->videoq.nb_packets >= MIN_MIN_FRAMES || is->video_stream < 0 || is->videoq.abort_request)) {
+            if (   (is->audioq.nb_packets > MIN_MIN_FRAMES || is->audio_stream < 0 || is->audioq.abort_request)
+                && (is->videoq.nb_packets > MIN_MIN_FRAMES || is->video_stream < 0 || is->videoq.abort_request)) {
                 ffp_toggle_buffering(ffp, 0);
             }
         }
@@ -4630,12 +7180,50 @@ void ffp_set_video_codec_info(FFPlayer *ffp, const char *module, const char *cod
     av_log(ffp, AV_LOG_INFO, "VideoCodec: %s\n", ffp->video_codec_info);
 }
 
+
+
+
+
 void ffp_set_audio_codec_info(FFPlayer *ffp, const char *module, const char *codec)
 {
     av_freep(&ffp->audio_codec_info);
     ffp->audio_codec_info = av_asprintf("%s, %s", module ? module : "", codec ? codec : "");
     av_log(ffp, AV_LOG_INFO, "AudioCodec: %s\n", ffp->audio_codec_info);
 }
+
+
+void ffp_set_frame_at_time(FFPlayer *ffp, const char *path, int64_t start_time, int64_t end_time, int num, int definition) {
+    if (!ffp->get_img_info) {
+        ffp->get_img_info = av_mallocz(sizeof(GetImgInfo));
+        if (!ffp->get_img_info) {
+            ffp_notify_msg3(ffp, FFP_MSG_GET_IMG_STATE, 0, -1);
+            return;
+        }
+    }
+
+    if (start_time >= 0 && num > 0 && end_time >= 0 && end_time >= start_time) {
+        ffp->get_img_info->img_path   = av_strdup(path);
+        ffp->get_img_info->start_time = start_time;
+        ffp->get_img_info->end_time   = end_time;
+        ffp->get_img_info->num        = num;
+        ffp->get_img_info->count      = num;
+        if (definition== HD_IMAGE) {
+            ffp->get_img_info->width  = 640;
+            ffp->get_img_info->height = 360;
+        } else if (definition == SD_IMAGE) {
+            ffp->get_img_info->width  = 320;
+            ffp->get_img_info->height = 180;
+        } else {
+            ffp->get_img_info->width  = 160;
+            ffp->get_img_info->height = 90;
+        }
+    } else {
+        ffp->get_img_info->count = 0;
+        ffp_notify_msg3(ffp, FFP_MSG_GET_IMG_STATE, 0, -1);
+    }
+}
+
+
 
 void ffp_set_subtitle_codec_info(FFPlayer *ffp, const char *module, const char *codec)
 {
@@ -4649,7 +7237,6 @@ void ffp_set_playback_rate(FFPlayer *ffp, float rate)
     if (!ffp)
         return;
 
-    av_log(ffp, AV_LOG_INFO, "Playback rate: %f\n", rate);
     ffp->pf_playback_rate = rate;
     ffp->pf_playback_rate_changed = 1;
 }
@@ -4761,8 +7348,6 @@ float ffp_get_property_float(FFPlayer *ffp, int id, float default_value)
             return ffp ? ffp->stat.avdiff : default_value;
         case FFP_PROP_FLOAT_PLAYBACK_VOLUME:
             return ffp ? ffp->pf_playback_volume : default_value;
-        case FFP_PROP_FLOAT_DROP_FRAME_RATE:
-            return ffp ? ffp->stat.drop_frame_rate : default_value;
         default:
             return default_value;
     }
@@ -4846,28 +7431,6 @@ int64_t ffp_get_property_int64(FFPlayer *ffp, int id, int64_t default_value)
             return ffp->stat.buf_capacity;
         case FFP_PROP_INT64_LATEST_SEEK_LOAD_DURATION:
             return ffp ? ffp->stat.latest_seek_load_duration : default_value;
-        case FFP_PROP_INT64_TRAFFIC_STATISTIC_BYTE_COUNT:
-            return ffp ? ffp->stat.byte_count : default_value;
-        case FFP_PROP_INT64_CACHE_STATISTIC_PHYSICAL_POS:
-            if (!ffp)
-                return default_value;
-            return ffp->stat.cache_physical_pos;
-       case FFP_PROP_INT64_CACHE_STATISTIC_FILE_FORWARDS:
-            if (!ffp)
-                return default_value;
-            return ffp->stat.cache_file_forwards;
-       case FFP_PROP_INT64_CACHE_STATISTIC_FILE_POS:
-            if (!ffp)
-                return default_value;
-            return ffp->stat.cache_file_pos;
-       case FFP_PROP_INT64_CACHE_STATISTIC_COUNT_BYTES:
-            if (!ffp)
-                return default_value;
-            return ffp->stat.cache_count_bytes;
-       case FFP_PROP_INT64_LOGICAL_FILE_SIZE:
-            if (!ffp)
-                return default_value;
-            return ffp->stat.logical_file_size;
         default:
             return default_value;
     }
@@ -4878,15 +7441,6 @@ void ffp_set_property_int64(FFPlayer *ffp, int id, int64_t value)
     switch (id) {
         // case FFP_PROP_INT64_SELECTED_VIDEO_STREAM:
         // case FFP_PROP_INT64_SELECTED_AUDIO_STREAM:
-        case FFP_PROP_INT64_SHARE_CACHE_DATA:
-            if (ffp) {
-                if (value) {
-                    ijkio_manager_will_share_cache_map(ffp->ijkio_manager_ctx);
-                } else {
-                    ijkio_manager_did_share_cache_map(ffp->ijkio_manager_ctx);
-                }
-            }
-            break;
         default:
             break;
     }
